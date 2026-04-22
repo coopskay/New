@@ -50,8 +50,29 @@ TEMP_UNIT  = "fahrenheit"
 ENS_MODEL  = "ecmwf_ifs025"            # 51-member ECMWF IFS ensemble
 AIFS_MODEL = "ecmwf_aifs025_ensemble"  # ECMWF AIFS ensemble
 
+# Statistical constants (normal-distribution derived):
+#   IQR (P25–P75) ≈ 1.349 σ  →  σ = IQR / 1.349
+#   P10–P90 span  ≈ 2.564 σ  →  σ = span / 2.564
+IQR_TO_SIGMA     = 1.349
+P10_P90_TO_SIGMA = 2.564
+
+# Half-life for freshness decay in anchor weighting: exp(-age / FRESHNESS_DECAY_HOURS)
+FRESHNESS_DECAY_HOURS = 18.0
+
+# Ensemble spread-scaling: above this multiplier use hybrid (cap + additive) approach
+SCALE_HYBRID_THRESHOLD = 1.5
+
+# Maximum concurrent data-source fetches in run_location
+MAX_CONCURRENT_FETCHES = 14
+
+# Minimum |edge| in percentage points before flagging a bucket as a consensus edge
+MIN_CONSENSUS_EDGE_PP = 5.0
+
+# σ threshold above which inter-model spread is flagged as high disagreement (°F)
+HIGH_SPREAD_THRESHOLD_F = 3.0
+
 # (lat, lon, display_label, station_id)
-PRESETS: dict[str, tuple] = {
+PRESETS: dict[str, tuple[float, float, str, str]] = {
     "kord": (41.9742, -87.9073,  "Chicago O'Hare (KORD)",     "KORD"),
     "ksea": (47.4499, -122.3118, "Seattle-Tacoma (KSEA)",     "KSEA"),
     "kdal": (32.8481, -96.8512,  "Dallas Love Field (KDAL)",  "KDAL"),
@@ -264,7 +285,7 @@ _QMD_REGION  = "co"
 _QMD_PCTS    = [10, 25, 50, 75, 90]
 _QMD_WORKERS = 10
 _QMD_TIMEOUT = 60
-_qmd_grid_cache: dict[tuple, int] = {}
+_qmd_grid_cache: dict[tuple[float, float], int] = {}
 
 
 def _qmd_urls(date: datetime, cycle: int, fxx: int) -> tuple[str, str]:
@@ -368,9 +389,9 @@ def _nbm_daily_max_pctls(vals_by_fxx_pct: dict, fxx_range: list) -> dict[int, fl
     p25_k = vals_by_fxx_pct.get((peak_fxx, 25))
     p75_k = vals_by_fxx_pct.get((peak_fxx, 75))
     if p10_k is not None and p90_k is not None:
-        sigma_hour_k = (p90_k - p10_k) / 2.564
+        sigma_hour_k = (p90_k - p10_k) / P10_P90_TO_SIGMA
     elif p25_k is not None and p75_k is not None:
-        sigma_hour_k = (p75_k - p25_k) / 1.349
+        sigma_hour_k = (p75_k - p25_k) / IQR_TO_SIGMA
     else:
         sigma_hour_k = 1.0  # fallback ~1.8°F
 
@@ -566,7 +587,19 @@ def _ens_stats_lines(member_highs, weights=None) -> list[str]:
     return lines
 
 
-def _weighted_percentile(values, weights, percentiles):
+def _weighted_percentile(
+    values: np.ndarray, weights: np.ndarray, percentiles: list[float]
+) -> np.ndarray:
+    """Weighted quantile estimation via sorted cumulative-weight interpolation.
+
+    Args:
+        values:      1-D array of sample values.
+        weights:     1-D non-negative weight array of the same length (need not sum to 1).
+        percentiles: List of percentile levels, e.g. [10, 50, 90].
+
+    Returns:
+        Array of interpolated quantile values, one per entry in *percentiles*.
+    """
     idx         = np.argsort(values)
     sorted_vals = values[idx]
     cumw        = np.cumsum(weights[idx])
@@ -740,7 +773,7 @@ def _fetch_ens_pp(
         ("AIFS", aifs_val,  0.4, ifs_age_approx),
     ]
     anchor_weights = {
-        name: wb * float(np.exp(-age / 18))
+        name: wb * float(np.exp(-age / FRESHNESS_DECAY_HOURS))
         for name, val, wb, age in anchor_candidates_adj if val is not None
     }
     anchor_vals = {
@@ -779,7 +812,6 @@ def _fetch_ens_pp(
     sigma_target  = float(np.sqrt(sigma_ens_corr ** 2 + sigma_anchor ** 2))
     scale         = sigma_target / sigma_ens if sigma_ens > 0 else 1.0
 
-    SCALE_HYBRID_THRESHOLD = 1.5
     shifted = raw + delta
     if scale <= SCALE_HYBRID_THRESHOLD:
         inflated = anchor + (shifted - anchor) * scale
@@ -1094,7 +1126,7 @@ def _fit_nbm_distribution(nbm_pctls: dict[int, float]):
     target = np.array([nbm_pctls[p] for p in _QMD_PCTS])
     med    = nbm_pctls[50]
     iqr    = nbm_pctls[75] - nbm_pctls[25]
-    scale0 = max(iqr / 1.349, 0.5)
+    scale0 = max(iqr / IQR_TO_SIGMA, 0.5)
 
     def sse(params):
         a, loc, sc = params
@@ -1111,7 +1143,7 @@ def _fit_nbm_distribution(nbm_pctls: dict[int, float]):
     except Exception:
         pass
 
-    sigma = (nbm_pctls[90] - nbm_pctls[10]) / 2.564
+    sigma = (nbm_pctls[90] - nbm_pctls[10]) / P10_P90_TO_SIGMA
     return norm(med, max(sigma, 0.1))
 
 
@@ -1304,7 +1336,7 @@ def compare_ensemble_to_market(
         flag = ""
         # Consensus: ≥2 of 3 sources agree in direction with |edge| ≥ 5pp
         valid_edges = [(e, src) for e, src in [(ens_edge, "ENS"), (nbm_edge, "NBM"), (aifs_edge, "AIFS")]
-                       if not np.isnan(e) and abs(e) >= 5]
+                       if not np.isnan(e) and abs(e) >= MIN_CONSENSUS_EDGE_PP]
         if len(valid_edges) >= 2:
             directions = set(np.sign(e) for e, _ in valid_edges)
             if len(directions) == 1:
@@ -1474,7 +1506,7 @@ def _print_ai_summary(
                     row += f"  {ae:>+8.1f}pp" if ae is not None else f"  {'n/a':>9}"
                 # Consensus flag
                 cons_edges = [x for x in [ens_e, e.get('nbm_edge'), e.get('aifs_edge')]
-                              if x is not None and abs(x) >= 5]
+                              if x is not None and abs(x) >= MIN_CONSENSUS_EDGE_PP]
                 if len(cons_edges) >= 2 and len(set(int(x > 0) for x in cons_edges)) == 1:
                     row += "  ★"
                 print(row)
@@ -1483,12 +1515,12 @@ def _print_ai_summary(
     consensus_buckets = [
         e for e in edge_data
         if sum(1 for x in [e.get('ens_edge'), e.get('nbm_edge'), e.get('aifs_edge')]
-               if x is not None and abs(x) >= 5) >= 2
+               if x is not None and abs(x) >= MIN_CONSENSUS_EDGE_PP) >= 2
         and len(set(int(x > 0) for x in [e.get('ens_edge'), e.get('nbm_edge'), e.get('aifs_edge')]
-                    if x is not None and abs(x) >= 5)) == 1
+                    if x is not None and abs(x) >= MIN_CONSENSUS_EDGE_PP)) == 1
     ]
     if consensus_buckets:
-        print(f"\nCONSENSUS EDGE FLAGS (≥2 of 3 model sources agree, |edge| ≥ 5pp):")
+        print(f"\nCONSENSUS EDGE FLAGS (≥2 of 3 model sources agree, |edge| ≥ {MIN_CONSENSUS_EDGE_PP:.0f}pp):")
         for e in consensus_buckets:
             direction = "OVER" if (e.get('ens_edge') or 0) > 0 else "UNDER"
             parts = []
@@ -1498,14 +1530,14 @@ def _print_ai_summary(
                     parts.append(f"{src} {v:+.1f}pp")
             print(f"  ★ {e['bucket']}: {direction}  " + "  ".join(parts))
     else:
-        print(f"\nCONSENSUS EDGE FLAGS: none flagged (no bucket with ≥2 sources at ≥5pp)")
+        print(f"\nCONSENSUS EDGE FLAGS: none flagged (no bucket with ≥2 sources at ≥{MIN_CONSENSUS_EDGE_PP:.0f}pp)")
 
     # ── Qualitative risk flags ──
     print(f"\nQUALITATIVE RISK FLAGS:")
     flags_printed = 0
 
     if live_vals:
-        if spread_std > 3.0:
+        if spread_std > HIGH_SPREAD_THRESHOLD_F:
             print(f"  ⚠ High inter-model spread (σ={spread_std:.1f}°F) — significant model uncertainty")
             flags_printed += 1
         elif spread_std < 1.0:
@@ -1618,8 +1650,6 @@ def _build_json_payload(
 
 # ─── Main orchestrator ────────────────────────────────────────────────────────
 
-_PRINT_LOCK = __import__("threading").Lock()
-
 def run_location(lat, lon, label, station_id, target_date: str,
                  write_json: bool = False, json_dir: str = ".") -> None:
     tz_name   = TIMEZONES.get(station_id)
@@ -1633,7 +1663,7 @@ def run_location(lat, lon, label, station_id, target_date: str,
     print(f"\n{label} — {target_date}  local {local_str} {utc_str}")
 
     # ── Phase 7: concurrent independent fetches ───────────────────────────────
-    with ThreadPoolExecutor(max_workers=14) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as ex:
         fut_metar    = ex.submit(_fetch_current_metar,  station_id)
         fut_obs      = ex.submit(_fetch_obs_history,    station_id, target_date, tz_name)
         fut_nws      = ex.submit(_fetch_nws,            lat, lon, target_date, now_utc)
