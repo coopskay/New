@@ -1,8 +1,10 @@
-import urllib.request
-import urllib.parse
+import argparse
+import io
 import json
 import re
 import sys
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -17,13 +19,19 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-class _Tee:
-    """Write to both the original stdout and a log file simultaneously."""
-    def __init__(self, log_path):
-        self._stdout = sys.stdout
-        self._log    = open(log_path, "w", encoding="utf-8")
+# ─── Logging ──────────────────────────────────────────────────────────────────
 
-    def write(self, data):
+class _Tee:
+    """Write to both stdout and an appending log file, with run-start timestamps."""
+
+    def __init__(self, log_path: str):
+        self._stdout = sys.stdout
+        self._log    = open(log_path, "a", encoding="utf-8")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%Mz")
+        self._log.write(f"\n{'='*70}\n  Run started {stamp}\n{'='*70}\n")
+        self._log.flush()
+
+    def write(self, data: str):
         self._stdout.write(data)
         self._log.write(data)
 
@@ -35,23 +43,26 @@ class _Tee:
         self._log.close()
         sys.stdout = self._stdout
 
-TARGET_DATE = "2026-04-22"
-TEMP_UNIT   = "fahrenheit"
-ENS_MODEL   = "ecmwf_ifs025"            # 51-member ECMWF IFS ensemble
-AIFS_MODEL  = "ecmwf_aifs025_ensemble"  # ECMWF AIFS ensemble (newer, may be unavailable)
 
-PRESETS = {
-    "kord": (41.9742, -87.9073,  "Chicago O'Hare (KORD)",    "KORD", "highest-temperature-in-chicago-on-april-22-2026"),
-    "ksea": (47.4499, -122.3118, "Seattle-Tacoma (KSEA)",    "KSEA", "highest-temperature-in-seattle-on-april-22-2026"),
-    "kdal": (32.8481, -96.8512,  "Dallas Love Field (KDAL)", "KDAL", "highest-temperature-in-dallas-on-april-22-2026"),
-    "klga": (40.7772, -73.8726,  "New York LaGuardia (KLGA)", "KLGA", "highest-temperature-in-nyc-on-april-22-2026"),
-    "katl": (33.6407, -84.4277,  "Atlanta (KATL)",            "KATL", "highest-temperature-in-atlanta-on-april-22-2026"),
-    "kaus": (30.1975, -97.6664,  "Austin-Bergstrom (KAUS)",   "KAUS", "highest-temperature-in-austin-on-april-22-2026"),
-    "khou": (29.6454, -95.2789,  "Houston Hobby (KHOU)",      "KHOU", "highest-temperature-in-houston-on-april-22-2026"),
-    "kmia": (25.7959, -80.2870,  "Miami (KMIA)",              "KMIA", "highest-temperature-in-miami-on-april-22-2026"),
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+TEMP_UNIT  = "fahrenheit"
+ENS_MODEL  = "ecmwf_ifs025"            # 51-member ECMWF IFS ensemble
+AIFS_MODEL = "ecmwf_aifs025_ensemble"  # ECMWF AIFS ensemble
+
+# (lat, lon, display_label, station_id)
+PRESETS: dict[str, tuple] = {
+    "kord": (41.9742, -87.9073,  "Chicago O'Hare (KORD)",     "KORD"),
+    "ksea": (47.4499, -122.3118, "Seattle-Tacoma (KSEA)",     "KSEA"),
+    "kdal": (32.8481, -96.8512,  "Dallas Love Field (KDAL)",  "KDAL"),
+    "klga": (40.7772, -73.8726,  "New York LaGuardia (KLGA)", "KLGA"),
+    "katl": (33.6407, -84.4277,  "Atlanta (KATL)",             "KATL"),
+    "kaus": (30.1975, -97.6664,  "Austin-Bergstrom (KAUS)",   "KAUS"),
+    "khou": (29.6454, -95.2789,  "Houston Hobby (KHOU)",      "KHOU"),
+    "kmia": (25.7959, -80.2870,  "Miami (KMIA)",               "KMIA"),
 }
 
-TIMEZONES = {
+TIMEZONES: dict[str, str] = {
     "KORD": "America/Chicago",
     "KSEA": "America/Los_Angeles",
     "KDAL": "America/Chicago",
@@ -62,104 +73,190 @@ TIMEZONES = {
     "KMIA": "America/New_York",
 }
 
+# WFO codes for NWS Area Forecast Discussion
+WFO_MAP: dict[str, str] = {
+    "KORD": "LOT",
+    "KSEA": "SEW",
+    "KDAL": "FWD",
+    "KLGA": "OKX",
+    "KATL": "FFC",
+    "KAUS": "EWX",
+    "KHOU": "HGX",
+    "KMIA": "MFL",
+}
+
+# Short city names for Polymarket slug generation
+CITY_SLUG_NAMES: dict[str, str] = {
+    "KORD": "chicago",
+    "KSEA": "seattle",
+    "KDAL": "dallas",
+    "KLGA": "nyc",
+    "KATL": "atlanta",
+    "KAUS": "austin",
+    "KHOU": "houston",
+    "KMIA": "miami",
+}
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
 def _k_to_f(k):
     return (k - 273.15) * 9 / 5 + 32 if k is not None else None
 
+def _c_to_f(c):
+    return c * 9 / 5 + 32 if c is not None else None
+
 def fetch_json(url, extra_headers=None):
-    headers = {"User-Agent": "weathernew.py/1.0"}
+    headers = {"User-Agent": "weathernew.py/2.0"}
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read())
 
 def fetch_json_params(base, params):
     return fetch_json(f"{base}?{urllib.parse.urlencode(params)}")
 
-# --- NWS ---
+def _polymarket_slug(station_id: str, target_date: str) -> str | None:
+    """Generate expected Polymarket slug: highest-temperature-in-{city}-on-{date}."""
+    city = CITY_SLUG_NAMES.get(station_id)
+    if not city:
+        return None
+    dt        = datetime.strptime(target_date, "%Y-%m-%d")
+    date_slug = f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}"
+    return f"highest-temperature-in-{city}-on-{date_slug}"
 
-def nws_high(lat, lon, target_date, now_utc):
-    points_data = fetch_json(f"https://api.weather.gov/points/{lat},{lon}")
-    hourly_url = points_data["properties"]["forecastHourly"]
-    forecast_data = fetch_json(hourly_url)
-    periods = forecast_data["properties"]["periods"]
-    raw_upd = forecast_data["properties"].get("updateTime", "")
-    upd = raw_upd[:16].replace("T", " ") + "z" if raw_upd else "unknown"
 
-    max_temp, max_unit = None, None
-    for p in periods:
-        if p["startTime"][:10] == target_date:
+# ─── NWS Hourly Forecast ──────────────────────────────────────────────────────
+
+def _fetch_nws(lat, lon, target_date, now_utc) -> dict:
+    """Returns {'output': list[str], 'max_temp_f': float|None}."""
+    lines: list[str] = []
+    result: dict     = {"max_temp_f": None}
+    try:
+        points_data   = fetch_json(f"https://api.weather.gov/points/{lat},{lon}")
+        hourly_url    = points_data["properties"]["forecastHourly"]
+        forecast_data = fetch_json(hourly_url)
+        periods       = forecast_data["properties"]["periods"]
+        raw_upd       = forecast_data["properties"].get("updateTime", "")
+        upd           = raw_upd[:16].replace("T", " ") + "z" if raw_upd else "unknown"
+
+        max_temp, max_unit = None, None
+        for p in periods:
+            if p["startTime"][:10] != target_date:
+                continue
             start_utc = datetime.fromisoformat(p["startTime"]).astimezone(timezone.utc)
             if start_utc < now_utc:
-                continue  # hour already past
+                continue
             if max_temp is None or p["temperature"] > max_temp:
                 max_temp = p["temperature"]
                 max_unit = p["temperatureUnit"]
 
-    if max_temp is None:
-        print(f"[NWS]        no data  (updated {upd})")
-    else:
-        print(f"[NWS]        {max_temp}°{max_unit}  (updated {upd})")
+        if max_temp is None:
+            lines.append(f"[NWS]        no data  (updated {upd})")
+        else:
+            lines.append(f"[NWS]        {max_temp}°{max_unit}  (updated {upd})")
+            result["max_temp_f"] = float(max_temp) if max_unit == "F" else _c_to_f(float(max_temp))
+    except Exception as e:
+        lines.append(f"[NWS]        error ({e})")
 
-# --- HRRR via Open-Meteo ---
+    result["output"] = lines
+    return result
 
-def hrrr_high(lat, lon, target_date, now_utc, obs_high=None, tz_name=None):
-    tz = ZoneInfo(tz_name) if tz_name else timezone.utc
-    tz_param = tz_name if tz_name else "UTC"
-    data = fetch_json_params("https://api.open-meteo.com/v1/forecast", {
-        "latitude": lat, "longitude": lon,
-        "hourly": "temperature_2m",
-        "models": "ncep_hrrr_conus",
-        "temperature_unit": TEMP_UNIT,
-        "timezone": tz_param,
-        "start_date": target_date, "end_date": target_date,
-    })
-    hourly = data.get("hourly", {})
-    cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
-    valid = [(t, v) for t, v in zip(hourly.get("time", []), hourly.get("temperature_2m", []))
-             if v is not None and t >= cutoff]
 
-    if not valid:
-        print("[HRRR]       no data for remainder of day")
-        return None
-    max_time, max_temp = max(valid, key=lambda x: x[1])
-    lo = min(v for _, v in valid)
-    peak_label = "local" if tz_name else "z"
-    print(f"[HRRR]       {max_temp:.1f}°F  (peak {max_time[-5:]} {peak_label}, range {lo:.1f}–{max_temp:.1f}°F, updated hourly)")
-    return max_temp
+# ─── Open-Meteo point-forecast (shared core) ─────────────────────────────────
 
-# --- NBM via Open-Meteo ---
-
-def nbm_high(lat, lon, target_date, now_utc, obs_high=None, tz_name=None):
-    tz = ZoneInfo(tz_name) if tz_name else timezone.utc
-    tz_param = tz_name if tz_name else "UTC"
+def _fetch_openmeteo_point(
+    lat, lon, target_date, now_utc, tz_name,
+    model: str, tag: str,
+    api_base: str = "https://api.open-meteo.com/v1/forecast",
+    with_wind_dewp: bool = True,
+) -> dict:
+    """
+    Fetch hourly T2m (+ optionally dewpoint + wind) from Open-Meteo for one model.
+    Returns dict with keys: output, temp_f, dewp_f, wind_mph, peak_time, hourly_temps_f.
+    'tag' is the bracketed label prefix used in output lines, e.g. '[HRRR]      '.
+    """
+    lines: list[str] = []
+    result: dict = {"temp_f": None, "dewp_f": None, "wind_mph": None,
+                    "peak_time": None, "hourly_temps_f": []}
     try:
-        data = fetch_json_params("https://api.open-meteo.com/v1/forecast", {
+        tz       = ZoneInfo(tz_name) if tz_name else timezone.utc
+        tz_param = tz_name or "UTC"
+        hvars    = "temperature_2m,dewpoint_2m,windspeed_10m" if with_wind_dewp else "temperature_2m"
+        params   = {
             "latitude": lat, "longitude": lon,
-            "hourly": "temperature_2m",
-            "models": "ncep_nbm_conus",
+            "hourly": hvars,
+            "models": model,
             "temperature_unit": TEMP_UNIT,
+            "windspeed_unit": "mph",
             "timezone": tz_param,
             "start_date": target_date, "end_date": target_date,
-        })
+        }
+        data   = fetch_json_params(api_base, params)
+        hourly = data.get("hourly", {})
+        cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
+        times  = hourly.get("time", [])
+        temps  = hourly.get("temperature_2m", [])
+        dewps  = hourly.get("dewpoint_2m", [None] * len(times))
+        winds  = hourly.get("windspeed_10m", [None] * len(times))
+
+        valid = [(t, v, d, w)
+                 for t, v, d, w in zip(times, temps, dewps, winds)
+                 if v is not None and t >= cutoff]
+
+        if not valid:
+            lines.append(f"{tag} no data for remainder of day")
+        else:
+            max_time, max_temp, max_dewp, max_wind = max(valid, key=lambda x: x[1])
+            lo         = min(v for _, v, _, _ in valid)
+            peak_label = "local" if tz_name else "z"
+            extras     = []
+            if max_dewp is not None:
+                extras.append(f"dewp {max_dewp:.1f}°F")
+            if max_wind is not None:
+                extras.append(f"wind {max_wind:.1f}mph")
+            ext_str = ("  " + "  ".join(extras)) if extras else ""
+            lines.append(f"{tag} {max_temp:.1f}°F  "
+                         f"(peak {max_time[-5:]} {peak_label}, range {lo:.1f}–{max_temp:.1f}°F"
+                         f"{ext_str})")
+            result["temp_f"]         = max_temp
+            result["dewp_f"]         = max_dewp
+            result["wind_mph"]       = max_wind
+            result["peak_time"]      = max_time
+            result["hourly_temps_f"] = [(t, v) for t, v, _, _ in valid]
     except Exception as e:
-        print(f"[NBM]        unavailable ({e})")
-        return None
-    hourly = data.get("hourly", {})
-    cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
-    valid = [(t, v) for t, v in zip(hourly.get("time", []), hourly.get("temperature_2m", []))
-             if v is not None and t >= cutoff]
+        lines.append(f"{tag} error ({e})")
 
-    if not valid:
-        print("[NBM]        no data for remainder of day")
-        return None
-    max_time, max_temp = max(valid, key=lambda x: x[1])
-    lo = min(v for _, v in valid)
-    peak_label = "local" if tz_name else "z"
-    print(f"[NBM]        {max_temp:.1f}°F  (peak {max_time[-5:]} {peak_label}, range {lo:.1f}–{max_temp:.1f}°F, updated hourly)")
-    return max_temp
+    result["output"] = lines
+    return result
 
-# --- NBM QMD percentile high-temperature forecast ---
+
+def _fetch_hrrr(lat, lon, target_date, now_utc, tz_name) -> dict:
+    return _fetch_openmeteo_point(lat, lon, target_date, now_utc, tz_name,
+                                  model="ncep_hrrr_conus", tag="[HRRR]      ")
+
+def _fetch_nbm(lat, lon, target_date, now_utc, tz_name) -> dict:
+    return _fetch_openmeteo_point(lat, lon, target_date, now_utc, tz_name,
+                                  model="ncep_nbm_conus", tag="[NBM]       ")
+
+def _fetch_gfs(lat, lon, target_date, now_utc, tz_name) -> dict:
+    return _fetch_openmeteo_point(lat, lon, target_date, now_utc, tz_name,
+                                  model="gfs_seamless", tag="[GFS]       ")
+
+def _fetch_ifs_det(lat, lon, target_date, now_utc, tz_name) -> dict:
+    return _fetch_openmeteo_point(lat, lon, target_date, now_utc, tz_name,
+                                  model="ecmwf_ifs025", tag="[ECMWF IFS] ",
+                                  api_base="https://api.open-meteo.com/v1/ecmwf",
+                                  with_wind_dewp=False)
+
+def _fetch_aifs_det(lat, lon, target_date, now_utc, tz_name) -> dict:
+    return _fetch_openmeteo_point(lat, lon, target_date, now_utc, tz_name,
+                                  model="ecmwf_aifs025", tag="[AIFS det]  ",
+                                  with_wind_dewp=False)
+
+
+# ─── NBM QMD percentile forecast (GRIB2 from NOMADS) ─────────────────────────
 
 _QMD_BASE    = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/v5.0"
 _QMD_CYCLES  = [0, 6, 12, 18]
@@ -167,7 +264,7 @@ _QMD_REGION  = "co"
 _QMD_PCTS    = [10, 25, 50, 75, 90]
 _QMD_WORKERS = 10
 _QMD_TIMEOUT = 60
-_qmd_grid_cache: dict[tuple, int] = {}   # {(lat, lon): grid_index}; same CONUS grid for all files
+_qmd_grid_cache: dict[tuple, int] = {}
 
 
 def _qmd_urls(date: datetime, cycle: int, fxx: int) -> tuple[str, str]:
@@ -247,27 +344,71 @@ def _qmd_decode(grib_bytes: bytes, lat: float, lon: float) -> float | None:
         return None
 
 
-def nbm_qmd_high_percentiles(lat: float, lon: float, now_utc: datetime,
-                              tz_name: str, target_date: str, obs_high: float | None = None) -> dict[int, float] | None:
+def _nbm_daily_max_pctls(vals_by_fxx_pct: dict, fxx_range: list) -> dict[int, float] | None:
     """
-    Fetch NBM QMD TMP percentiles for the remaining hours of target_date (local time).
-    Returns {10: F, 25: F, 50: F, 75: F, 90: F} where all percentiles are from the hour
-    with the highest P50 value (proxy for "hour of peak heating").
-    
-    LIMITATION: These percentiles reflect intensity-only uncertainty at a single forecast hour,
-    not the full range of timing uncertainty. This is a slight underestimate of spread because
-    real-world peak heating could occur in adjacent hours with different temperatures.
+    Compute daily-max temperature percentiles using a spread-adjusted normal.
+
+    Combines the hour-of-peak spread (sigma_hour, from P10/P90 at the peak hour)
+    with timing uncertainty (sigma_timing, from the spread of P50 values across
+    the top hours) into sigma_total = sqrt(sigma_hour^2 + sigma_timing^2).
+
+    All internal values are in Kelvin; returned values are in Fahrenheit.
     """
+    hourly_p50_k = {fxx: vals_by_fxx_pct[(fxx, 50)]
+                    for fxx in fxx_range if (fxx, 50) in vals_by_fxx_pct}
+    if not hourly_p50_k:
+        return None
+
+    peak_fxx   = max(hourly_p50_k, key=lambda f: hourly_p50_k[f])
+    peak_p50_k = hourly_p50_k[peak_fxx]
+
+    # sigma_hour: intensity spread at the peak hour
+    p10_k = vals_by_fxx_pct.get((peak_fxx, 10))
+    p90_k = vals_by_fxx_pct.get((peak_fxx, 90))
+    p25_k = vals_by_fxx_pct.get((peak_fxx, 25))
+    p75_k = vals_by_fxx_pct.get((peak_fxx, 75))
+    if p10_k is not None and p90_k is not None:
+        sigma_hour_k = (p90_k - p10_k) / 2.564
+    elif p25_k is not None and p75_k is not None:
+        sigma_hour_k = (p75_k - p25_k) / 1.349
+    else:
+        sigma_hour_k = 1.0  # fallback ~1.8°F
+
+    # sigma_timing: how much the daily max could vary due to timing uncertainty.
+    # Use the spread of the top-3 hourly P50 values as a proxy.
+    sorted_p50 = sorted(hourly_p50_k.values(), reverse=True)
+    top        = sorted_p50[:min(3, len(sorted_p50))]
+    sigma_timing_k = (top[0] - top[-1]) / 2.0 if len(top) > 1 else 0.0
+
+    sigma_total_k = (sigma_hour_k ** 2 + sigma_timing_k ** 2) ** 0.5
+    sigma_total_f = sigma_total_k * 9 / 5
+    peak_p50_f    = _k_to_f(peak_p50_k)
+
+    # Normal-distribution quantiles
+    z = {10: -1.282, 25: -0.674, 50: 0.0, 75: 0.674, 90: 1.282}
+    return {p: peak_p50_f + z[p] * sigma_total_f for p in _QMD_PCTS}
+
+
+def nbm_qmd_high_percentiles(
+    lat: float, lon: float, now_utc: datetime,
+    tz_name: str, target_date: str, obs_high: float | None = None,
+) -> dict | None:
+    """
+    Fetch NBM QMD TMP percentiles for the remaining hours of target_date.
+    Returns dict with keys: output, peak_hour, daily_max, run_str, cycle, or None on failure.
+      peak_hour  – percentiles at the single hour with highest P50
+      daily_max  – spread-adjusted distribution (sigma_hour + sigma_timing combined)
+    """
+    lines: list[str] = []
     try:
         date, cycle = _qmd_latest_cycle()
     except RuntimeError as e:
-        print(f"[NBM QMD]    {e}")
-        return None
-    
-    # Warn if cycle is stale (> 8 hours old)
+        return {"output": [f"[NBM QMD]    {e}"], "peak_hour": None, "daily_max": None}
+
     cycle_age_hours = (now_utc - date.replace(tzinfo=timezone.utc)).total_seconds() / 3600
     if cycle_age_hours > 8:
-        print(f"[NBM QMD]    [warn] stale cycle: {cycle_age_hours:.1f} hours old (run {date.strftime('%Y-%m-%d')} {cycle:02d}z)")
+        lines.append(f"[NBM QMD]    [warn] stale cycle: {cycle_age_hours:.1f}h old "
+                     f"(run {date.strftime('%Y-%m-%d')} {cycle:02d}z)")
 
     tz  = ZoneInfo(tz_name)
     y, m, d = int(target_date[:4]), int(target_date[5:7]), int(target_date[8:10])
@@ -281,27 +422,27 @@ def nbm_qmd_high_percentiles(lat: float, lon: float, now_utc: datetime,
         if from_local <= (init_utc + timedelta(hours=fxx)).astimezone(tz) <= eod_local
     ]
     if not fxx_range:
-        print("[NBM QMD]    no remaining forecast hours today")
-        return None
+        return {"output": ["[NBM QMD]    no remaining forecast hours today"],
+                "peak_hour": None, "daily_max": None}
 
-    # Step 1: fetch all idx files in parallel
+    # Fetch idx files in parallel
     idx_by_fxx: dict[int, list[str] | None] = {}
     with ThreadPoolExecutor(max_workers=_QMD_WORKERS) as ex:
         futs = {ex.submit(_qmd_fetch_idx, date, cycle, fxx): fxx for fxx in fxx_range}
         for fut in as_completed(futs):
             idx_by_fxx[futs[fut]] = fut.result()
 
-    # Step 2: build per-message download tasks
-    tasks: list[tuple[int, int, str, dict]] = []  # (fxx, pct, grib_url, rec)
+    # Build download tasks
+    tasks: list[tuple[int, int, str, dict]] = []
     for fxx in fxx_range:
-        lines = idx_by_fxx.get(fxx)
-        if not lines:
+        lines_idx = idx_by_fxx.get(fxx)
+        if not lines_idx:
             continue
         grib_url, _ = _qmd_urls(date, cycle, fxx)
-        for pct, rec in _qmd_parse_tmp_recs(lines).items():
+        for pct, rec in _qmd_parse_tmp_recs(lines_idx).items():
             tasks.append((fxx, pct, grib_url, rec))
 
-    # Step 3: fetch all GRIB bytes in parallel
+    # Fetch GRIB bytes in parallel
     raw_by_key: dict[tuple[int, int], bytes | None] = {}
     with ThreadPoolExecutor(max_workers=_QMD_WORKERS) as ex:
         futs = {ex.submit(_qmd_fetch_bytes, grib_url, rec): (fxx, pct)
@@ -309,105 +450,70 @@ def nbm_qmd_high_percentiles(lat: float, lon: float, now_utc: datetime,
         for fut in as_completed(futs):
             raw_by_key[futs[fut]] = fut.result()
 
-    # Step 4: decode sequentially (eccodes not thread-safe); collect per-pct raw Kelvin values
-    # and track per-fxx values to find peak P50 hour
-    vals_by_pct: dict[int, list[float]] = {p: [] for p in _QMD_PCTS}
-    vals_by_fxx_pct: dict[tuple[int, int], float] = {}  # (fxx, pct) -> Kelvin value
+    # Decode sequentially (eccodes not thread-safe)
+    vals_by_fxx_pct: dict[tuple[int, int], float] = {}
     for (fxx, pct), raw in raw_by_key.items():
         if raw is None:
             continue
         v = _qmd_decode(raw, lat, lon)
         if v is not None:
-            vals_by_pct[pct].append(v)
             vals_by_fxx_pct[(fxx, pct)] = v
 
-    # Step 5: find the hour (fxx) with highest P50, then return all percentiles from that hour
-    # This is "hour of peak heating" percentiles, not max-per-percentile
+    # Peak-hour percentiles (existing logic: pick hour with highest P50)
     peak_p50_fxx = None
-    peak_p50_val = -273.15  # absolute zero in Kelvin
+    peak_p50_val = -999.0
     for fxx in fxx_range:
-        if (fxx, 50) in vals_by_fxx_pct:
-            val = vals_by_fxx_pct[(fxx, 50)]
-            if val > peak_p50_val:
-                peak_p50_val = val
-                peak_p50_fxx = fxx
+        if (fxx, 50) in vals_by_fxx_pct and vals_by_fxx_pct[(fxx, 50)] > peak_p50_val:
+            peak_p50_val = vals_by_fxx_pct[(fxx, 50)]
+            peak_p50_fxx = fxx
 
-    result: dict[int, float] = {}
+    peak_hour: dict[int, float] = {}
     if peak_p50_fxx is not None:
         for p in _QMD_PCTS:
             if (peak_p50_fxx, p) in vals_by_fxx_pct:
-                result[p] = _k_to_f(vals_by_fxx_pct[(peak_p50_fxx, p)])
+                peak_hour[p] = _k_to_f(vals_by_fxx_pct[(peak_p50_fxx, p)])
 
-    if len(result) < 3:
-        print("[NBM QMD]    insufficient data")
-        return None
+    if len(peak_hour) < 3:
+        return {"output": ["[NBM QMD]    insufficient data"],
+                "peak_hour": None, "daily_max": None}
 
-    run_str    = f"{date.strftime('%Y-%m-%d')} {cycle:02d}z"
-    pct_str    = "  ".join(f"{p}th:{result[p]:.1f}" for p in _QMD_PCTS if p in result)
+    # Daily-max percentiles (spread-adjusted)
+    daily_max = _nbm_daily_max_pctls(vals_by_fxx_pct, fxx_range)
+
+    run_str = f"{date.strftime('%Y-%m-%d')} {cycle:02d}z"
     first_valid = (init_utc + timedelta(hours=fxx_range[0])).astimezone(ZoneInfo(tz_name))
     last_valid  = (init_utc + timedelta(hours=fxx_range[-1])).astimezone(ZoneInfo(tz_name))
     window_str  = (f"{first_valid.strftime('%I%p').lstrip('0').lower()}–"
                    f"{last_valid.strftime('%I%p').lstrip('0').lower()}")
-    
-    # Note: these are "hour of peak heating" percentiles, not "daily max" percentiles
-    peak_p50_hour_utc = (init_utc + timedelta(hours=peak_p50_fxx)).astimezone(ZoneInfo(tz_name))
-    peak_time_str = peak_p50_hour_utc.strftime("%I%p").lstrip("0").lower()
-    print(f"[NBM QMD]    {pct_str}°F  (hour of peak heating {peak_time_str} local, run {run_str}, window {window_str})")
-    print(f"             [intensity-only uncertainty; timing uncertainty not included]")
-    
-    # Diagnostic: if obs_high floors the distribution meaningfully, note it
+
+    peak_p50_hour_local = (init_utc + timedelta(hours=peak_p50_fxx)).astimezone(ZoneInfo(tz_name))
+    peak_time_str = peak_p50_hour_local.strftime("%I%p").lstrip("0").lower()
+
+    ph_str = "  ".join(f"{p}th:{peak_hour[p]:.1f}" for p in _QMD_PCTS if p in peak_hour)
+    lines.append(f"[NBM QMD]    peak-hour → {ph_str}°F")
+    lines.append(f"             (peak {peak_time_str} local, run {run_str}, window {window_str})")
+    lines.append(f"             [intensity-only uncertainty at single hour]")
+
+    if daily_max:
+        dm_str = "  ".join(f"{p}th:{daily_max[p]:.1f}" for p in _QMD_PCTS if p in daily_max)
+        lines.append(f"[NBM QMD]    daily-max → {dm_str}°F")
+        lines.append(f"             [spread-adjusted: sigma_hour + sigma_timing combined]")
+
     if obs_high is not None:
-        # Count how many percentiles are floored
-        floored = [p for p in _QMD_PCTS if result[p] < obs_high]
-        if len(floored) >= 3:  # half or more — material shift
-            highest_floored = max(floored)
-            print(f"  [note] obs_high {obs_high:.1f}°F floors QMD P{highest_floored} and below; "
-                  f"effective distribution collapses toward upper tail")
-        elif obs_high > result[50]:
-            print(f"  [note] obs_high {obs_high:.1f}°F above QMD P50 ({result[50]:.1f}°F); "
-                  f"distribution moderately shifted by floor")
-    
-    return result
+        floored = [p for p in _QMD_PCTS if p in peak_hour and peak_hour[p] < obs_high]
+        if len(floored) >= 3:
+            lines.append(f"  [note] obs_high {obs_high:.1f}°F floors QMD P{max(floored)} and below")
+        elif obs_high > peak_hour.get(50, 0):
+            lines.append(f"  [note] obs_high {obs_high:.1f}°F above QMD P50 ({peak_hour.get(50):.1f}°F)")
+
+    return {"output": lines, "peak_hour": peak_hour, "daily_max": daily_max, "run_str": run_str}
 
 
-# --- ECMWF IFS deterministic ---
+# ─── Ensemble statistics helper ───────────────────────────────────────────────
 
-def ecmwf_deterministic_high(lat, lon, target_date, now_utc, obs_high=None, tz_name=None):
-    tz = ZoneInfo(tz_name) if tz_name else timezone.utc
-    tz_param = tz_name if tz_name else "UTC"
-    data = fetch_json_params("https://api.open-meteo.com/v1/ecmwf", {
-        "latitude": lat, "longitude": lon,
-        "hourly": "temperature_2m",
-        "temperature_unit": TEMP_UNIT,
-        "timezone": tz_param,
-        "start_date": target_date, "end_date": target_date,
-    })
-    hourly = data["hourly"]
-    times = hourly.get("time", [])
-    model_run = times[0].replace("T", " ") if times else "unknown"
-    cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
-    vals = [v for t, v in zip(times, hourly.get("temperature_2m", []))
-            if v is not None and t >= cutoff]
-
-    if not vals:
-        print("[ECMWF IFS]  no data for remainder of day")
-        return None
-    max_val = max(vals)
-    print(f"[ECMWF IFS]  {max_val:.1f}°F  (model run {model_run})")
-    return max_val
-
-# --- Shared ensemble stats printer ---
-
-def _weighted_percentile(values, weights, percentiles):
-    """Weighted quantiles via linear interpolation on the empirical CDF."""
-    idx         = np.argsort(values)
-    sorted_vals = values[idx]
-    cumw        = np.cumsum(weights[idx])
-    cumw       /= cumw[-1]
-    return np.interp([p / 100 for p in percentiles], cumw, sorted_vals)
-
-
-def _print_ens_stats(member_highs, weights=None):
+def _ens_stats_lines(member_highs, weights=None) -> list[str]:
+    """Return formatted ensemble statistics as a list of strings (no printing)."""
+    lines: list[str] = []
     maxes = np.array(member_highs)
 
     if weights is not None:
@@ -417,111 +523,189 @@ def _print_ens_stats(member_highs, weights=None):
         std_val  = float(np.sqrt(np.average((maxes - mean_val) ** 2, weights=w)))
         p        = _weighted_percentile(maxes, w, [5, 10, 25, 50, 75, 90, 95])
     else:
-        w        = None
         mean_val = float(np.mean(maxes))
         std_val  = float(np.std(maxes))
         p        = np.percentile(maxes, [5, 10, 25, 50, 75, 90, 95])
 
     pct_labels = ["5th", "10th", "25th", "50th", "75th", "90th", "95th"]
-    pct_str = "  ".join(f"{l}:{v:.1f}" for l, v in zip(pct_labels, p))
-    print(f"  Mean {mean_val:.1f}  Median {p[3]:.1f}  Std {std_val:.1f}  Range {np.min(maxes):.1f}–{np.max(maxes):.1f}°F")
-    print(f"  {pct_str}°F")
+    pct_str    = "  ".join(f"{l}:{v:.1f}" for l, v in zip(pct_labels, p))
+    lines.append(f"  Mean {mean_val:.1f}  Median {p[3]:.1f}  Std {std_val:.1f}"
+                 f"  Range {np.min(maxes):.1f}–{np.max(maxes):.1f}°F")
+    lines.append(f"  {pct_str}°F")
 
     bar_max = 24
-    if w is not None:
+    if weights is not None:
         wcounts, edges = np.histogram(maxes, bins=10, weights=w)
-        print(f"\n  Distribution ({len(member_highs)} members, weighted):")
+        lines.append(f"\n  Distribution ({len(member_highs)} members, weighted):")
         peak = wcounts.max()
         for i in range(len(wcounts)):
             lo, hi = edges[i], edges[i + 1]
             bar = "█" * int(wcounts[i] / peak * bar_max) if peak > 0 else ""
-            print(f"  {lo:>5.1f}–{hi:<5.1f}°F  {wcounts[i]*100:>4.1f}%  {bar}")
+            lines.append(f"  {lo:>5.1f}–{hi:<5.1f}°F  {wcounts[i]*100:>4.1f}%  {bar}")
     else:
         counts, edges = np.histogram(maxes, bins=10)
-        print(f"\n  Distribution ({len(member_highs)} members):")
+        lines.append(f"\n  Distribution ({len(member_highs)} members):")
         for i in range(len(counts)):
             lo, hi = edges[i], edges[i + 1]
-            bar = "█" * int(counts[i] / counts.max() * bar_max)
-            print(f"  {lo:>5.1f}–{hi:<5.1f}°F  {counts[i]:>3}  {bar}")
+            bar    = "█" * int(counts[i] / counts.max() * bar_max)
+            lines.append(f"  {lo:>5.1f}–{hi:<5.1f}°F  {counts[i]:>3}  {bar}")
 
     p5_t  = round(float(p[0]))
     p95_t = round(float(p[6]))
-    thresholds = list(range(p5_t, p95_t + 1, 5))
-    probs = []
-    for t in thresholds:
-        if w is not None:
+    thresh = list(range(p5_t, p95_t + 1, 5))
+    probs  = []
+    for t in thresh:
+        if weights is not None:
             prob = float(np.sum(w[maxes >= t])) * 100
         else:
             prob = float(np.mean(maxes >= t)) * 100
         probs.append(f"P(>={t}) {prob:.0f}%")
     if probs:
-        print(f"\n  " + "  ".join(probs))
+        lines.append("\n  " + "  ".join(probs))
+
+    return lines
 
 
-# --- ECMWF IFS Ensemble (ecmwf_ifs025, 51 members) ---
-
-def ecmwf_ensemble_high(lat, lon, label, target_date, now_utc, tz_name=None):
-    tz = ZoneInfo(tz_name) if tz_name else timezone.utc
-    tz_param = tz_name if tz_name else "UTC"
-    data = fetch_json_params("https://ensemble-api.open-meteo.com/v1/ensemble", {
-        "latitude": lat, "longitude": lon,
-        "hourly": "temperature_2m",
-        "models": ENS_MODEL,
-        "start_date": target_date, "end_date": target_date,
-        "temperature_unit": TEMP_UNIT,
-        "timezone": tz_param,
-    })
-    hourly = data.get("hourly", {})
-
-    # First timestamp in the UTC hourly data is the model run init time
-    times = hourly.get("time", [])
-    model_run = times[0].replace("T", " ") if times else "unknown"
-    cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
-
-    member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
-    if "temperature_2m" in hourly and "temperature_2m" not in member_keys:
-        member_keys = ["temperature_2m"] + member_keys
-
-    member_highs = []
-    for key in member_keys:
-        vals = [v for t, v in zip(times, hourly.get(key, [])) if v is not None and t >= cutoff]
-        if vals:
-            member_highs.append(max(vals))
-
-    print(f"\n[ECMWF ENS]  {label} — {target_date}  ({len(member_highs)} members, model run {model_run})")
-    if not member_highs:
-        print("  No data returned")
-        return
-    _print_ens_stats(member_highs)
+def _weighted_percentile(values, weights, percentiles):
+    idx         = np.argsort(values)
+    sorted_vals = values[idx]
+    cumw        = np.cumsum(weights[idx])
+    cumw       /= cumw[-1]
+    return np.interp([p / 100 for p in percentiles], cumw, sorted_vals)
 
 
-# --- ECMWF AIFS (commented out) ---
+def _print_ens_stats(member_highs, weights=None):
+    for line in _ens_stats_lines(member_highs, weights):
+        print(line)
 
-# def aifs_deterministic_high(lat, lon, label, target_date): ...
-# def aifs_ensemble_high(lat, lon, label, target_date): ...
 
-# --- ECMWF AIFS (commented out) ---
+# ─── ECMWF IFS Ensemble ───────────────────────────────────────────────────────
 
-# def aifs_deterministic_high(lat, lon, label, target_date): ...
-# def aifs_ensemble_high(lat, lon, label, target_date): ...
+def _fetch_ifs_ens(lat, lon, target_date, now_utc, tz_name) -> dict:
+    """Returns {'output': list[str], 'member_highs': list[float], 'model_run': str}."""
+    lines: list[str] = []
+    result: dict = {"member_highs": [], "model_run": "unknown"}
+    try:
+        tz       = ZoneInfo(tz_name) if tz_name else timezone.utc
+        tz_param = tz_name or "UTC"
+        data     = fetch_json_params("https://ensemble-api.open-meteo.com/v1/ensemble", {
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m",
+            "models": ENS_MODEL,
+            "start_date": target_date, "end_date": target_date,
+            "temperature_unit": TEMP_UNIT,
+            "timezone": tz_param,
+        })
+        hourly   = data.get("hourly", {})
+        times    = hourly.get("time", [])
+        model_run = times[0].replace("T", " ") if times else "unknown"
+        cutoff   = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
 
-# --- Post-processed ensemble (bias-corrected + spread-inflated) ---
+        member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
+        if "temperature_2m" in hourly and "temperature_2m" not in member_keys:
+            member_keys = ["temperature_2m"] + member_keys
 
-def ecmwf_ensemble_postprocessed(lat, lon, label, target_date, hrrr_val, nbm_val, ifs_val=None, now_utc=None, obs_high=None, tz_name=None):
+        member_highs = []
+        for key in member_keys:
+            vals = [v for t, v in zip(times, hourly.get(key, []))
+                    if v is not None and t >= cutoff]
+            if vals:
+                member_highs.append(max(vals))
+
+        result["member_highs"] = member_highs
+        result["model_run"]    = model_run
+        lines.append(f"\n[ECMWF ENS]  {len(member_highs)} members, model run {model_run}")
+        if not member_highs:
+            lines.append("  No data returned")
+        else:
+            lines.extend(_ens_stats_lines(member_highs))
+    except Exception as e:
+        lines.append(f"\n[ECMWF ENS]  error ({e})")
+
+    result["output"] = lines
+    return result
+
+
+# ─── ECMWF AIFS Ensemble ──────────────────────────────────────────────────────
+
+def _fetch_aifs_ens(lat, lon, target_date, now_utc, tz_name) -> dict:
+    """Returns {'output': list[str], 'member_highs': list[float], 'model_run': str}."""
+    lines: list[str] = []
+    result: dict = {"member_highs": [], "model_run": "unknown"}
+    try:
+        tz       = ZoneInfo(tz_name) if tz_name else timezone.utc
+        tz_param = tz_name or "UTC"
+        data     = fetch_json_params("https://ensemble-api.open-meteo.com/v1/ensemble", {
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m",
+            "models": AIFS_MODEL,
+            "start_date": target_date, "end_date": target_date,
+            "temperature_unit": TEMP_UNIT,
+            "timezone": tz_param,
+        })
+        hourly    = data.get("hourly", {})
+        times     = hourly.get("time", [])
+        model_run = times[0].replace("T", " ") if times else "unknown"
+        cutoff    = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
+
+        member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
+        if "temperature_2m" in hourly and "temperature_2m" not in member_keys:
+            member_keys = ["temperature_2m"] + member_keys
+
+        member_highs = []
+        for key in member_keys:
+            vals = [v for t, v in zip(times, hourly.get(key, []))
+                    if v is not None and t >= cutoff]
+            if vals:
+                member_highs.append(max(vals))
+
+        result["member_highs"] = member_highs
+        result["model_run"]    = model_run
+        lines.append(f"\n[AIFS ENS]   {len(member_highs)} members, model run {model_run}")
+        if not member_highs:
+            lines.append("  No data returned")
+        else:
+            lines.extend(_ens_stats_lines(member_highs))
+    except Exception as e:
+        lines.append(f"\n[AIFS ENS]   unavailable ({e})")
+
+    result["output"] = lines
+    return result
+
+
+# ─── ECMWF IFS Ensemble post-processed ───────────────────────────────────────
+
+def _fetch_ens_pp(
+    lat, lon, label, target_date,
+    hrrr_val, nbm_val, gfs_val, ifs_val, aifs_val,
+    now_utc, obs_high, tz_name,
+) -> dict:
     """
-    Shift the raw ENS distribution to match a freshness-weighted anchor, then scale
-    spread using a two-component variance model: ensemble under-dispersion correction
-    plus anchor uncertainty (stdev across fresh point forecasts).
+    Bias-correct + spread-inflate the IFS ensemble using a freshness-weighted
+    anchor across HRRR, NBM, GFS, IFS-det, and AIFS-det.
+    Returns {'output': list[str], 'member_highs': list[float], 'anchor': float|None}.
     """
-    if all(v is None for v in [hrrr_val, nbm_val, ifs_val]):
-        print(f"\n[ECMWF ENS PP]  {label} — skipped (no fresh anchor available)")
-        return None
+    lines: list[str] = []
+    result: dict = {"member_highs": [], "anchor": None}
 
-    tz = ZoneInfo(tz_name) if tz_name else timezone.utc
-    tz_param = tz_name if tz_name else "UTC"
+    anchor_candidates = [
+        ("HRRR", hrrr_val,  0.7, 0.0),
+        ("NBM",  nbm_val,   1.0, 0.0),
+        ("GFS",  gfs_val,   0.5, 2.0),
+        ("IFS",  ifs_val,   0.4, 9.0),   # age estimated below
+        ("AIFS", aifs_val,  0.4, 9.0),
+    ]
+    live = [(name, val, wb, age)
+            for name, val, wb, age in anchor_candidates if val is not None]
+    if not live:
+        lines.append(f"\n[ECMWF ENS PP]  {label} — skipped (no anchor available)")
+        result["output"] = lines
+        return result
 
     try:
-        data = fetch_json_params("https://ensemble-api.open-meteo.com/v1/ensemble", {
+        tz       = ZoneInfo(tz_name) if tz_name else timezone.utc
+        tz_param = tz_name or "UTC"
+        data     = fetch_json_params("https://ensemble-api.open-meteo.com/v1/ensemble", {
             "latitude": lat, "longitude": lon,
             "hourly": "temperature_2m",
             "models": ENS_MODEL,
@@ -530,108 +714,109 @@ def ecmwf_ensemble_postprocessed(lat, lon, label, target_date, hrrr_val, nbm_val
             "timezone": tz_param,
         })
     except Exception as e:
-        print(f"\n[ECMWF ENS PP]  {label} — unavailable ({e})")
-        return None
+        lines.append(f"\n[ECMWF ENS PP]  {label} — unavailable ({e})")
+        result["output"] = lines
+        return result
 
     hourly = data.get("hourly", {})
-    times = hourly.get("time", [])
-    cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M") if now_utc is not None else ""
+    times  = hourly.get("time", [])
+    cutoff = now_utc.astimezone(tz).strftime("%Y-%m-%dT%H:%M") if now_utc else ""
 
-    # Step 5: Include the IFS control run (temperature_2m) alongside perturbed members
+    # Approximate IFS/AIFS age from first timestamp
+    ifs_age_approx = 9.0
+    if times and now_utc is not None:
+        try:
+            run_dt       = datetime.fromisoformat(times[0]).astimezone(timezone.utc)
+            ifs_age_approx = max(0.0, (now_utc - run_dt).total_seconds() / 3600)
+        except Exception:
+            pass
+
+    # Rebuild with actual IFS age
+    anchor_candidates_adj = [
+        ("HRRR", hrrr_val,  0.7, 0.0),
+        ("NBM",  nbm_val,   1.0, 0.0),
+        ("GFS",  gfs_val,   0.5, 2.0),
+        ("IFS",  ifs_val,   0.4, ifs_age_approx),
+        ("AIFS", aifs_val,  0.4, ifs_age_approx),
+    ]
+    anchor_weights = {
+        name: wb * float(np.exp(-age / 18))
+        for name, val, wb, age in anchor_candidates_adj if val is not None
+    }
+    anchor_vals = {
+        name: val
+        for name, val, _, _ in anchor_candidates_adj if val is not None
+    }
+    total_w = sum(anchor_weights.values())
+    anchor  = sum(anchor_weights[k] * anchor_vals[k] for k in anchor_weights) / total_w
+
     member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
     if "temperature_2m" in hourly and "temperature_2m" not in member_keys:
         member_keys = ["temperature_2m"] + member_keys
 
     raw_highs = []
     for key in member_keys:
-        vals = [v for t, v in zip(times, hourly.get(key, [])) if v is not None and t >= cutoff]
+        vals = [v for t, v in zip(times, hourly.get(key, []))
+                if v is not None and t >= cutoff]
         if vals:
             raw_highs.append(max(vals))
 
     if not raw_highs:
-        print(f"\n[ECMWF ENS PP]  {label} — no data returned")
-        return None
+        lines.append(f"\n[ECMWF ENS PP]  {label} — no data returned")
+        result["output"] = lines
+        return result
     if len(raw_highs) < 50:
-        print(f"  [warn] only {len(raw_highs)} members found (expected ≥50)")
+        lines.append(f"  [warn] only {len(raw_highs)} members (expected ≥50)")
 
-    # Step 4: Freshness-adjusted weighted anchor
-    # IFS age estimated from ensemble model run time (inferred from times[0], which is an approximation)
-    # Ideally we'd get the actual model run timestamp from metadata, but Open-Meteo doesn't expose it directly
-    ifs_age_hours_approx = 9.0  # conservative fallback
-    if times and now_utc is not None:
-        try:
-            run_dt_approx = datetime.fromisoformat(times[0]).astimezone(timezone.utc)
-            ifs_age_hours_approx = max(0.0, (now_utc - run_dt_approx).total_seconds() / 3600)
-        except Exception:
-            print(f"  [warn] could not parse IFS model run time approximation from '{times[0] if times else ''}'; using fallback age {ifs_age_hours_approx:.0f}h")
+    raw       = np.array(raw_highs)
+    ens_mean  = float(np.mean(raw))
+    delta     = anchor - ens_mean
 
-    _anchor_candidates = [
-        ("HRRR", hrrr_val, 0.7, 0.0),
-        ("NBM",  nbm_val,  1.0, 0.0),
-        ("IFS",  ifs_val,  0.4, ifs_age_hours_approx),
-    ]
-    anchor_weights = {
-        name: w_base * float(np.exp(-age / 18))
-        for name, val, w_base, age in _anchor_candidates if val is not None
-    }
-    anchor_vals = {
-        name: val
-        for name, val, w_base, age in _anchor_candidates if val is not None
-    }
-    total_w = sum(anchor_weights.values())
-    anchor = sum(anchor_weights[k] * anchor_vals[k] for k in anchor_weights) / total_w
-
-    raw = np.array(raw_highs)
-    ens_mean = float(np.mean(raw))
-    delta    = anchor - ens_mean
-
-    # Two-component variance model
-    sigma_ens = float(np.std(raw))
-    anchor_pts = list(anchor_vals.values())
-    sigma_anchor = max(float(np.std(anchor_pts)) if len(anchor_pts) >= 2 else 0.0, 0.5)
-    sigma_ens_corrected = sigma_ens * 1.15
-    sigma_target = float(np.sqrt(sigma_ens_corrected ** 2 + sigma_anchor ** 2))
-    scale = sigma_target / sigma_ens if sigma_ens > 0 else 1.0
+    sigma_ens     = float(np.std(raw))
+    anchor_pts    = list(anchor_vals.values())
+    sigma_anchor  = max(float(np.std(anchor_pts)) if len(anchor_pts) >= 2 else 0.0, 0.5)
+    sigma_ens_corr = sigma_ens * 1.15
+    sigma_target  = float(np.sqrt(sigma_ens_corr ** 2 + sigma_anchor ** 2))
+    scale         = sigma_target / sigma_ens if sigma_ens > 0 else 1.0
 
     SCALE_HYBRID_THRESHOLD = 1.5
-    # Shift entire distribution to anchor, then scale spread around new mean
     shifted = raw + delta
     if scale <= SCALE_HYBRID_THRESHOLD:
         inflated = anchor + (shifted - anchor) * scale
     else:
-        # Hybrid: cap multiplicative scale, then add independent Gaussian noise
-        # to cover the remaining variance gap without over-stretching members.
-        capped_scale = SCALE_HYBRID_THRESHOLD
-        inflated = anchor + (shifted - anchor) * capped_scale
+        capped_scale  = SCALE_HYBRID_THRESHOLD
+        inflated      = anchor + (shifted - anchor) * capped_scale
         sigma_residual = float(np.sqrt(max(sigma_target ** 2 - (sigma_ens * capped_scale) ** 2, 0.0)))
-        seed = hash(f"{label}_{target_date}") & 0xFFFFFFFF
-        rng = np.random.default_rng(seed)
-        inflated = inflated + rng.normal(0.0, sigma_residual, size=inflated.shape)
-        print(f"  [note] scale={scale:.2f}x > {SCALE_HYBRID_THRESHOLD} — hybrid correction applied: "
-              f"multiplicative cap={capped_scale}x + additive σ_extra={sigma_residual:.2f}°F")
+        seed           = hash(f"{label}_{target_date}") & 0xFFFFFFFF
+        rng            = np.random.default_rng(seed)
+        inflated       = inflated + rng.normal(0.0, sigma_residual, size=inflated.shape)
+        lines.append(f"  [note] scale={scale:.2f}x > {SCALE_HYBRID_THRESHOLD} — hybrid: "
+                     f"cap={capped_scale}x + σ_extra={sigma_residual:.2f}°F")
 
-    # Warn if all raw point forecasts are below obs_high (daily high locked at obs)
     if obs_high is not None:
-        raw_pts = [v for v in [hrrr_val, nbm_val, ifs_val] if v is not None]
+        raw_pts = [v for v in anchor_vals.values()]
         if raw_pts and all(v < obs_high for v in raw_pts):
-            print(f"  [note] all model forecasts ({', '.join(f'{v:.1f}' for v in raw_pts)}°F) below "
-                  f"obs_high ({obs_high:.1f}°F); daily high effectively locked at obs_high")
+            lines.append(f"  [note] all model forecasts below obs_high ({obs_high:.1f}°F); "
+                         f"daily high effectively locked at obs_high")
         inflated = np.maximum(inflated, obs_high)
 
-    weight_str = "  ".join(f"{k}:{anchor_weights[k]:.2f}" for k in anchor_weights)
-    print(f"\n[ECMWF ENS PP]  {label} — {target_date}  "
-          f"({len(raw_highs)} members, anchor={anchor:.1f}°F [weights: {weight_str}], "
-          f"delta={delta:+.1f}°F, σ_ens={sigma_ens:.2f}°F, σ_anchor={sigma_anchor:.2f}°F, "
-          f"scale={scale:.2f}x)")
-    _print_ens_stats(list(inflated))
-    return inflated
+    w_str = "  ".join(f"{k}:{anchor_weights[k]:.2f}" for k in anchor_weights)
+    lines.append(f"\n[ECMWF ENS PP]  {label} — {target_date}  "
+                 f"({len(raw_highs)} members, anchor={anchor:.1f}°F [{w_str}], "
+                 f"delta={delta:+.1f}°F, σ_ens={sigma_ens:.2f}°F, "
+                 f"σ_anchor={sigma_anchor:.2f}°F, scale={scale:.2f}x)")
+    lines.extend(_ens_stats_lines(list(inflated)))
+
+    result["member_highs"] = list(inflated)
+    result["anchor"]       = anchor
+    result["output"]       = lines
+    return result
 
 
-# --- Current temperature from latest METAR ---
+# ─── METAR / Obs ──────────────────────────────────────────────────────────────
 
 def _metar_obs_utc(ob):
-    """Return the true observation time as a UTC-aware datetime.
-    Prefers obsTime (Unix epoch, unrounded) over reportTime (rounded to hour)."""
+    """Return observation time as UTC-aware datetime."""
     epoch = ob.get("obsTime")
     if epoch is not None:
         return datetime.fromtimestamp(int(epoch), tz=timezone.utc)
@@ -641,11 +826,11 @@ def _metar_obs_utc(ob):
     return None
 
 
-def fetch_current_metar(station_id):
-    """Returns (temp_F, time_str) from the latest ASOS/METAR observation, or (None, None) on failure.
-    Priority: NWS observations (5-minute ASOS, no token) → aviationweather.gov."""
+def _fetch_current_metar(station_id) -> dict:
+    """Returns {'output': list[str], 'temp_f': float|None, 'time_str': str|None}."""
+    result: dict = {"temp_f": None, "time_str": None, "output": []}
 
-    # NWS observations — includes 5-minute ASOS readings between METARs, no token required
+    # NWS 5-minute ASOS (preferred)
     try:
         data     = fetch_json(f"https://api.weather.gov/stations/{station_id}/observations?limit=5")
         features = data.get("features", [])
@@ -658,48 +843,61 @@ def fetch_current_metar(station_id):
             ts      = props.get("timestamp", "")
             obs_utc = datetime.fromisoformat(ts).astimezone(timezone.utc)
             temp_f  = temp_c * 9 / 5 + 32
-            return temp_f, obs_utc.strftime("%H:%Mz")
+            result["temp_f"]   = temp_f
+            result["time_str"] = obs_utc.strftime("%H:%Mz")
+            result["output"]   = [f"[OBS CURRENT] {temp_f:.1f}°F  current temperature  "
+                                   f"(updated {result['time_str']})"]
+            return result
     except Exception as e:
-        print(f"  [NWS obs fetch failed: {e}]")
+        result["output"].append(f"  [NWS obs fetch failed: {e}]")
 
-    # Last resort: aviationweather.gov (METAR only, ~hourly)
+    # Fallback: aviationweather.gov
     try:
         data = fetch_json(
-            f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=json"
-        )
-        if not data:
-            return None, None
-        ob      = data[0]
-        temp_c  = ob.get("temp")
-        obs_utc = _metar_obs_utc(ob)
-        if temp_c is None or obs_utc is None:
-            return None, None
-        temp_f = temp_c * 9 / 5 + 32
-        return temp_f, obs_utc.strftime("%H:%Mz")
+            f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=json")
+        if data:
+            ob      = data[0]
+            temp_c  = ob.get("temp")
+            obs_utc = _metar_obs_utc(ob)
+            if temp_c is not None and obs_utc is not None:
+                temp_f             = temp_c * 9 / 5 + 32
+                result["temp_f"]   = temp_f
+                result["time_str"] = obs_utc.strftime("%H:%Mz")
+                result["output"]   = [f"[OBS CURRENT] {temp_f:.1f}°F  current temperature  "
+                                       f"(updated {result['time_str']})"]
+                return result
     except Exception as e:
-        print(f"  [METAR fetch failed: {e}]")
-    return None, None
+        result["output"].append(f"  [METAR fetch failed: {e}]")
+
+    result["output"].append("[OBS CURRENT] no data")
+    return result
 
 
-def fetch_observed_high_today(station_id, target_date, tz_name, routine_only=False):
-    """Returns (max_temp_F, local_time_str, utc_time_str) for the observed high today, or (None, None, None).
-    If routine_only=True, SPECIs are excluded.
-    Uses aviationweather.gov."""
-
-    # aviationweather.gov
+def _fetch_obs_history(station_id, target_date, tz_name) -> dict:
+    """
+    Fetch all METAR/SPECI obs for target_date from aviationweather.gov.
+    Returns dict with keys: output, high_all_f, high_routine_f, high_all_local,
+    high_all_utc, high_routine_local, high_routine_utc, history (list of dicts).
+    """
+    result: dict = {
+        "high_all_f": None, "high_routine_f": None,
+        "high_all_local": None, "high_all_utc": None,
+        "high_routine_local": None, "high_routine_utc": None,
+        "history": [], "output": [],
+    }
     try:
         data = fetch_json(
-            f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=json&hours=24"
-        )
+            f"https://aviationweather.gov/api/data/metar?ids={station_id}&format=json&hours=24")
         if not data:
-            return None, None, None
-        tz = ZoneInfo(tz_name) if tz_name else timezone.utc
-        best_temp  = None
-        best_local = None
-        best_utc   = None
+            result["output"] = ["[OBS HIGH]    no data"]
+            return result
+
+        tz      = ZoneInfo(tz_name) if tz_name else timezone.utc
+        history = []
+        best_all     = None
+        best_routine = None
+
         for ob in data:
-            if routine_only and ob.get("metarType", "METAR") == "SPECI":
-                continue
             temp_c  = ob.get("temp")
             obs_utc = _metar_obs_utc(ob)
             if temp_c is None or obs_utc is None:
@@ -707,41 +905,158 @@ def fetch_observed_high_today(station_id, target_date, tz_name, routine_only=Fal
             obs_local = obs_utc.astimezone(tz)
             if obs_local.strftime("%Y-%m-%d") != target_date:
                 continue
-            temp_f = temp_c * 9 / 5 + 32
-            if best_temp is None or temp_f > best_temp:
-                best_temp  = temp_f
-                best_local = obs_local.strftime("%H:%M %Z")
-                best_utc   = obs_utc.strftime("%H:%Mz")
-        return best_temp, best_local, best_utc
-    except Exception:
-        return None, None, None
+
+            temp_f    = temp_c * 9 / 5 + 32
+            dewp_c    = ob.get("dewp")
+            dewp_f    = _c_to_f(dewp_c) if dewp_c is not None else None
+            obs_type  = ob.get("metarType", "METAR")
+            is_routine = obs_type != "SPECI"
+
+            history.append({
+                "time_utc":   obs_utc.strftime("%H:%Mz"),
+                "time_local": obs_local.strftime("%H:%M %Z"),
+                "temp_f":     round(temp_f, 1),
+                "dewp_f":     round(dewp_f, 1) if dewp_f is not None else None,
+                "type":       "ROUTINE" if is_routine else "SPECI",
+            })
+
+            if best_all is None or temp_f > best_all["temp_f"]:
+                best_all = {
+                    "temp_f": temp_f,
+                    "local":  obs_local.strftime("%H:%M %Z"),
+                    "utc":    obs_utc.strftime("%H:%Mz"),
+                }
+            if is_routine and (best_routine is None or temp_f > best_routine["temp_f"]):
+                best_routine = {
+                    "temp_f": temp_f,
+                    "local":  obs_local.strftime("%H:%M %Z"),
+                    "utc":    obs_utc.strftime("%H:%Mz"),
+                }
+
+        # Sort history chronologically
+        history.sort(key=lambda x: x["time_utc"])
+        result["history"] = history
+
+        lines: list[str] = []
+        if best_all:
+            result["high_all_f"]     = best_all["temp_f"]
+            result["high_all_local"] = best_all["local"]
+            result["high_all_utc"]   = best_all["utc"]
+            lines.append(f"[OBS HIGH]    {best_all['temp_f']:.1f}°F  "
+                         f"observed high (all obs)  "
+                         f"({best_all['local']} / {best_all['utc']})")
+        else:
+            lines.append("[OBS HIGH]    no data")
+
+        if best_routine:
+            result["high_routine_f"]     = best_routine["temp_f"]
+            result["high_routine_local"] = best_routine["local"]
+            result["high_routine_utc"]   = best_routine["utc"]
+            suffix = "  ← ENS floor" if best_routine["temp_f"] != (best_all or {}).get("temp_f") else ""
+            lines.append(f"[OBS ROUTINE] {best_routine['temp_f']:.1f}°F  "
+                         f"routine METARs only  "
+                         f"({best_routine['local']} / {best_routine['utc']}){suffix}")
+        else:
+            lines.append("[OBS ROUTINE] no data")
+
+        # Observation history table
+        if history:
+            lines.append("\n[OBS HISTORY] (chronological, today)")
+            lines.append(f"  {'UTC':>5}  {'Local':>10}  {'Temp':>6}  {'Dewp':>6}  {'Type'}")
+            lines.append(f"  {'─'*5}  {'─'*10}  {'─'*6}  {'─'*6}  {'─'*7}")
+            for h in history:
+                dewp_s = f"{h['dewp_f']:>5.1f}" if h['dewp_f'] is not None else "   n/a"
+                flag   = "" if h["type"] == "ROUTINE" else " ★SPECI"
+                lines.append(f"  {h['time_utc']:>5}  {h['time_local']:>10}  "
+                              f"{h['temp_f']:>5.1f}°F  {dewp_s}°F  {h['type']}{flag}")
+
+        result["output"] = lines
+    except Exception as e:
+        result["output"] = [f"[OBS HIGH]    error ({e})"]
+
+    return result
 
 
-# --- Polymarket prediction market odds ---
+# ─── NWS Area Forecast Discussion ─────────────────────────────────────────────
 
-def polymarket_odds(slug, label):
-    """Fetch and display Polymarket odds for the given event slug."""
+def _fetch_nws_afd(station_id) -> dict:
+    """
+    Fetch the NWS Area Forecast Discussion for the station's WFO.
+    Returns {'output': list[str], 'short_term': str|None, 'wfo': str|None}.
+    """
+    result: dict = {"short_term": None, "wfo": None, "output": []}
+    wfo = WFO_MAP.get(station_id)
+    if not wfo:
+        return result
+    result["wfo"] = wfo
+    try:
+        data  = fetch_json(f"https://api.weather.gov/products?type=AFD&location={wfo}")
+        items = data.get("@graph", [])
+        if not items:
+            result["output"] = [f"[NWS AFD]    no AFD found for WFO {wfo}"]
+            return result
+
+        product_id = items[0].get("id")
+        if not product_id:
+            result["output"] = [f"[NWS AFD]    product ID missing for WFO {wfo}"]
+            return result
+
+        product = fetch_json(f"https://api.weather.gov/products/{product_id}")
+        text    = product.get("productText", "")
+
+        # Try SHORT TERM → NEAR TERM → SYNOPSIS
+        excerpt = None
+        for section in ("SHORT TERM", "NEAR TERM", "SYNOPSIS"):
+            pat   = rf"\.{section}[^\n]*\.\n(.*?)(?=\n\.[A-Z]|\Z)"
+            match = re.search(pat, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                excerpt = match.group(1).strip()[:2000]
+                break
+
+        if not excerpt:
+            excerpt = text[:1000]
+
+        result["short_term"] = excerpt
+        issuance = items[0].get("issuanceTime", "")[:16].replace("T", " ") + "z"
+        lines    = [f"\n[NWS AFD]    WFO {wfo}  (issued {issuance})",
+                    "─" * 60]
+        lines   += [f"  {ln}" for ln in excerpt.splitlines()]
+        lines.append("─" * 60)
+        result["output"] = lines
+    except Exception as e:
+        result["output"] = [f"[NWS AFD]    error ({e})"]
+
+    return result
+
+
+# ─── Polymarket ───────────────────────────────────────────────────────────────
+
+def _fetch_polymarket(slug, label) -> dict:
+    """Returns {'output': list[str], 'rows': list[(label, prob)]|None, 'slug': str}."""
+    result: dict = {"rows": None, "slug": slug, "output": []}
+    if not slug:
+        result["output"] = ["\n[POLYMARKET]  no slug available"]
+        return result
     try:
         data = fetch_json(f"https://gamma-api.polymarket.com/events?slug={slug}")
     except Exception as e:
-        print(f"\n[POLYMARKET]  unavailable ({e})")
-        return None
+        result["output"] = [f"\n[POLYMARKET]  unavailable ({e})"]
+        return result
 
     if not data:
-        print(f"\n[POLYMARKET]  no event found for slug: {slug}")
-        return None
+        result["output"] = [f"\n[POLYMARKET]  no event found for slug: {slug}"]
+        return result
 
-    event = data[0] if isinstance(data, list) else data
+    event   = data[0] if isinstance(data, list) else data
     markets = event.get("markets", [])
     if not markets:
-        print(f"\n[POLYMARKET]  no markets found")
-        return None
+        result["output"] = ["\n[POLYMARKET]  no markets found"]
+        return result
 
-    # Extract range label and "Yes" probability from each market
     rows = []
     for m in markets:
         question = m.get("question", "")
-        prices = m.get("outcomePrices", "[]")
+        prices   = m.get("outcomePrices", "[]")
         if isinstance(prices, str):
             try:
                 prices = json.loads(prices)
@@ -751,36 +1066,35 @@ def polymarket_odds(slug, label):
             yes_prob = float(prices[0]) * 100
         except (IndexError, ValueError, TypeError):
             continue
-        # Pull the temperature range out of the question text
-        match = re.search(r"be (.+?)\s+on\s+April", question, re.IGNORECASE)
+        match      = re.search(r"be (.+?)\s+on\s+\w+", question, re.IGNORECASE)
         range_label = re.sub(r"^between\s+", "", match.group(1) if match else question)
         rows.append((range_label, yes_prob))
 
     fetched_at = datetime.now(timezone.utc).strftime("%H:%Mz")
-    print(f"\n[POLYMARKET]  {label}  (fetched {fetched_at})")
-
-    bar_max = 20
-    peak = max((p for _, p in rows), default=1)
+    lines      = [f"\n[POLYMARKET]  {label}  (fetched {fetched_at})"]
+    bar_max    = 20
+    peak       = max((p for _, p in rows), default=1)
     for range_label, prob in rows:
         bar = "█" * int(prob / peak * bar_max) if peak > 0 else ""
-        print(f"  {range_label:<22}  {prob:>5.1f}%  {bar}")
-    return rows
+        lines.append(f"  {range_label:<22}  {prob:>5.1f}%  {bar}")
+
+    result["rows"]   = rows
+    result["output"] = lines
+    return result
 
 
-# --- NBM distribution fitting + bucket probabilities ---
+# ─── Distribution fitting + bucket probabilities ──────────────────────────────
 
 def _fit_nbm_distribution(nbm_pctls: dict[int, float]):
     """
-    Fit skew-normal to the five NBM percentile values.
+    Fit skew-normal to five NBM percentile values.
     Returns a frozen scipy distribution, or None on failure.
-    Falls back to Gaussian if skew-normal is poorly constrained.
     """
     probs  = [p / 100 for p in _QMD_PCTS]
     target = np.array([nbm_pctls[p] for p in _QMD_PCTS])
-
     med    = nbm_pctls[50]
     iqr    = nbm_pctls[75] - nbm_pctls[25]
-    scale0 = max(iqr / 1.349, 0.5)   # IQR of normal ≈ 1.349σ
+    scale0 = max(iqr / 1.349, 0.5)
 
     def sse(params):
         a, loc, sc = params
@@ -797,8 +1111,7 @@ def _fit_nbm_distribution(nbm_pctls: dict[int, float]):
     except Exception:
         pass
 
-    # Gaussian fallback
-    sigma = (nbm_pctls[90] - nbm_pctls[10]) / 2.564   # P10–P90 span ≈ 2.564σ
+    sigma = (nbm_pctls[90] - nbm_pctls[10]) / 2.564
     return norm(med, max(sigma, 0.1))
 
 
@@ -811,13 +1124,12 @@ def _nbm_bucket_probs(nbm_pctls: dict[int, float],
     """
     if nbm_pctls is None or not market_rows:
         return None
-
     dist = _fit_nbm_distribution(nbm_pctls)
     if dist is None:
         return None
 
-    floor       = obs_high if obs_high is not None else -np.inf
-    p_above     = 1.0 - dist.cdf(floor)
+    floor   = obs_high if obs_high is not None else -np.inf
+    p_above = 1.0 - dist.cdf(floor)
     if p_above <= 0:
         return None
 
@@ -842,20 +1154,51 @@ def _nbm_bucket_probs(nbm_pctls: dict[int, float],
             continue
 
         probs.append(max(0.0, raw / p_above) * 100)
-
     return probs
 
 
-# --- Phase 2: ENS PP vs NBM percentile diagnostic ---
+def _ens_bucket_probs(member_highs: list[float],
+                      market_rows: list,
+                      obs_high: float | None = None) -> list[float] | None:
+    """Compute bucket probabilities directly from ensemble member daily highs."""
+    if not member_highs or not market_rows:
+        return None
+    members = np.array(member_highs)
+    if obs_high is not None:
+        members = np.maximum(members, obs_high)
 
-def _print_pctl_compare(ens_members, nbm_pctls: dict[int, float] | None) -> None:
-    if ens_members is None or nbm_pctls is None:
+    probs = []
+    for label, _ in market_rows:
+        m_below = re.match(r"(\d+\.?\d*)°?F?\s+or\s+below",  label, re.IGNORECASE)
+        m_range = re.match(r"(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)°?F?", label, re.IGNORECASE)
+        m_above = re.match(r"(\d+\.?\d*)°?F?\s+or\s+higher", label, re.IGNORECASE)
+
+        if m_below:
+            hi   = float(m_below.group(1)) + 0.5
+            prob = float(np.mean(members < hi)) * 100
+        elif m_range:
+            lo   = float(m_range.group(1)) - 0.5
+            hi   = float(m_range.group(2)) + 0.5
+            prob = float(np.mean((members >= lo) & (members < hi))) * 100
+        elif m_above:
+            lo   = float(m_above.group(1)) - 0.5
+            prob = float(np.mean(members >= lo)) * 100
+        else:
+            probs.append(float("nan"))
+            continue
+        probs.append(prob)
+    return probs
+
+
+# ─── Percentile comparison ────────────────────────────────────────────────────
+
+def _print_pctl_compare(ens_pp_members, nbm_pctls, aifs_members=None) -> None:
+    if ens_pp_members is None or nbm_pctls is None:
         return
 
     pcts     = [10, 25, 50, 75, 90]
-    ens_vals = np.percentile(np.array(ens_members), pcts)
+    ens_vals = np.percentile(np.array(ens_pp_members), pcts)
     nbm_vals = [nbm_pctls.get(p) for p in pcts]
-
     if any(v is None for v in nbm_vals):
         return
 
@@ -864,42 +1207,72 @@ def _print_pctl_compare(ens_members, nbm_pctls: dict[int, float] | None) -> None
     print(f"\n[PCTL COMPARE]")
     print(hdr)
     print("  ENS PP    " + "".join(f"  {v:>{col}.1f}" for v in ens_vals))
-    print("  NBM       " + "".join(f"  {v:>{col}.1f}" for v in nbm_vals))
+    print("  NBM QMD   " + "".join(f"  {v:>{col}.1f}" for v in nbm_vals))
+    if aifs_members:
+        aifs_vals = np.percentile(np.array(aifs_members), pcts)
+        print("  AIFS ENS  " + "".join(f"  {v:>{col}.1f}" for v in aifs_vals))
+        delta_aifs = [float(e) - float(a) for e, a in zip(ens_vals, aifs_vals)]
+        print("  Δ ENS-AIFS" + "".join(f"  {d:>+{col}.1f}" for d in delta_aifs))
+
     deltas = [float(e) - float(n) for e, n in zip(ens_vals, nbm_vals)]
-    print("  Δ         " + "".join(f"  {d:>+{col}.1f}" for d in deltas))
+    print("  Δ ENS-NBM " + "".join(f"  {d:>+{col}.1f}" for d in deltas))
 
     tail_warn = abs(deltas[0]) > 1.5 or abs(deltas[-1]) > 1.5
     if tail_warn:
-        print("  [WARN] ENS-NBM percentile disagreement > 1.5°F at tails"
-              " — ENS spread may be miscalibrated")
+        print("  [WARN] ENS-NBM percentile disagreement > 1.5°F at tails")
 
 
-# --- Ensemble vs market comparison ---
+# ─── Edge comparison table ────────────────────────────────────────────────────
 
-def compare_ensemble_to_market(inflated_members, market_rows,
-                                nbm_probs: list[float] | None = None):
+def compare_ensemble_to_market(
+    ens_pp_members, market_rows,
+    nbm_probs: list[float] | None = None,
+    aifs_probs: list[float] | None = None,
+) -> tuple[list[str], list[dict]]:
     """
-    Side-by-side bucket probability table: ENS PP vs NBM (if available) vs Market.
-    Phase 4: flags buckets where both sources agree in direction and |edge| >= 5pp.
+    Side-by-side bucket probability table: ENS PP, NBM, AIFS vs Market.
+    Returns (output_lines, edge_data_list).
+    Consensus flag (★) when ≥2 of 3 sources agree in direction with |edge| ≥ 5pp.
     """
-    if market_rows is None or inflated_members is None or len(inflated_members) == 0:
-        return
-    members  = np.array(inflated_members)
-    has_nbm  = nbm_probs is not None and len(nbm_probs) == len(market_rows)
+    lines: list[str] = []
+    edges: list[dict] = []
 
+    if market_rows is None or ens_pp_members is None or len(ens_pp_members) == 0:
+        return lines, edges
+
+    members  = np.array(ens_pp_members)
+    has_nbm  = nbm_probs  is not None and len(nbm_probs)  == len(market_rows)
+    has_aifs = aifs_probs is not None and len(aifs_probs) == len(market_rows)
+
+    # Header
+    hdr_cols = f"{'Bucket':<24}  {'ENS PP':>8}"
+    sep_cols = f"  {'─'*22}  {'─'*8}"
     if has_nbm:
-        print(f"\n{'Bucket':<24}  {'ENS':>8}  {'NBM':>8}  {'Market':>8}  {'Edge(ENS)':>10}  {'Edge(NBM)':>10}")
-        print(f"  {'─'*22}  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*10}  {'─'*10}")
-    else:
-        print(f"\n{'Bucket':<24}  {'Ensemble':>8}  {'Market':>8}  {'Edge':>8}")
-        print(f"  {'─'*22}  {'─'*8}  {'─'*8}  {'─'*8}")
+        hdr_cols += f"  {'NBM QMD':>8}"
+        sep_cols += f"  {'─'*8}"
+    if has_aifs:
+        hdr_cols += f"  {'AIFS ENS':>8}"
+        sep_cols += f"  {'─'*8}"
+    hdr_cols += f"  {'Market':>8}"
+    sep_cols += f"  {'─'*8}"
+    if has_nbm or has_aifs:
+        hdr_cols += f"  {'Edge(ENS)':>10}"
+        sep_cols += f"  {'─'*10}"
+    if has_nbm:
+        hdr_cols += f"  {'Edge(NBM)':>10}"
+        sep_cols += f"  {'─'*10}"
+    if has_aifs:
+        hdr_cols += f"  {'Edge(AIFS)':>10}"
+        sep_cols += f"  {'─'*10}"
+    lines.append(f"\n{hdr_cols}")
+    lines.append(sep_cols)
 
-    agreed: list[tuple[str, float, float]] = []
+    agreed: list[tuple[str, float, float | None, float | None]] = []
 
-    for i, (label, mkt_prob) in enumerate(market_rows):
-        m_below = re.match(r"(\d+\.?\d*)°?F?\s+or\s+below",  label, re.IGNORECASE)
-        m_range = re.match(r"(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)°?F?", label, re.IGNORECASE)
-        m_above = re.match(r"(\d+\.?\d*)°?F?\s+or\s+higher", label, re.IGNORECASE)
+    for i, (lbl, mkt_prob) in enumerate(market_rows):
+        m_below = re.match(r"(\d+\.?\d*)°?F?\s+or\s+below",  lbl, re.IGNORECASE)
+        m_range = re.match(r"(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)°?F?", lbl, re.IGNORECASE)
+        m_above = re.match(r"(\d+\.?\d*)°?F?\s+or\s+higher", lbl, re.IGNORECASE)
 
         if m_below:
             hi       = float(m_below.group(1))
@@ -913,44 +1286,482 @@ def compare_ensemble_to_market(inflated_members, market_rows,
         else:
             ens_prob = float("nan")
 
-        nbm_p = nbm_probs[i] if has_nbm else float("nan")
+        nbm_p  = nbm_probs[i]  if has_nbm  else float("nan")
+        aifs_p = aifs_probs[i] if has_aifs else float("nan")
 
-        if np.isnan(ens_prob):
-            if has_nbm:
-                print(f"  {label:<22}  {'n/a':>8}  {'n/a':>8}  {mkt_prob:>7.1f}%  {'n/a':>10}  {'n/a':>10}")
-            else:
-                print(f"  {label:<22}  {'n/a':>8}  {mkt_prob:>7.1f}%  {'n/a':>8}")
-            continue
+        ens_edge  = ens_prob  - mkt_prob if not np.isnan(ens_prob)  else float("nan")
+        nbm_edge  = nbm_p     - mkt_prob if not np.isnan(nbm_p)     else float("nan")
+        aifs_edge = aifs_p    - mkt_prob if not np.isnan(aifs_p)    else float("nan")
 
-        ens_edge = ens_prob - mkt_prob
+        # Build row string
+        row = f"  {lbl:<22}  {ens_prob:>7.1f}%"
+        if has_nbm:
+            row += f"  {nbm_p:>7.1f}%" if not np.isnan(nbm_p) else f"  {'n/a':>8}"
+        if has_aifs:
+            row += f"  {aifs_p:>7.1f}%" if not np.isnan(aifs_p) else f"  {'n/a':>8}"
+        row += f"  {mkt_prob:>7.1f}%"
 
-        if has_nbm and not np.isnan(nbm_p):
-            nbm_edge = nbm_p - mkt_prob
-            flag = ""
-            if (np.sign(ens_edge) == np.sign(nbm_edge)
-                    and abs(ens_edge) >= 5 and abs(nbm_edge) >= 5):
+        flag = ""
+        # Consensus: ≥2 of 3 sources agree in direction with |edge| ≥ 5pp
+        valid_edges = [(e, src) for e, src in [(ens_edge, "ENS"), (nbm_edge, "NBM"), (aifs_edge, "AIFS")]
+                       if not np.isnan(e) and abs(e) >= 5]
+        if len(valid_edges) >= 2:
+            directions = set(np.sign(e) for e, _ in valid_edges)
+            if len(directions) == 1:
                 flag = "  ★"
-                agreed.append((label, ens_edge, nbm_edge))
-            print(f"  {label:<22}  {ens_prob:>7.1f}%  {nbm_p:>7.1f}%  {mkt_prob:>7.1f}%"
-                  f"  {ens_edge:>+9.1f}pp  {nbm_edge:>+9.1f}pp{flag}")
-        else:
-            if has_nbm:
-                print(f"  {label:<22}  {ens_prob:>7.1f}%  {'n/a':>8}  {mkt_prob:>7.1f}%"
-                      f"  {ens_edge:>+9.1f}pp  {'n/a':>10}")
-            else:
-                print(f"  {label:<22}  {ens_prob:>7.1f}%  {mkt_prob:>7.1f}%  {ens_edge:>+7.1f}pp")
+                agreed.append((lbl, ens_edge, nbm_edge if has_nbm else None,
+                                aifs_edge if has_aifs else None))
 
-    # Phase 4: agreement summary
+        if not np.isnan(ens_edge):
+            row += f"  {ens_edge:>+9.1f}pp"
+        if has_nbm:
+            row += f"  {nbm_edge:>+9.1f}pp" if not np.isnan(nbm_edge) else f"  {'n/a':>10}"
+        if has_aifs:
+            row += f"  {aifs_edge:>+9.1f}pp" if not np.isnan(aifs_edge) else f"  {'n/a':>10}"
+
+        lines.append(row + flag)
+        edges.append({
+            "bucket":    lbl,
+            "ens_prob":  round(ens_prob,  1) if not np.isnan(ens_prob)  else None,
+            "nbm_prob":  round(nbm_p,     1) if not np.isnan(nbm_p)     else None,
+            "aifs_prob": round(aifs_p,    1) if not np.isnan(aifs_p)    else None,
+            "market_prob": mkt_prob,
+            "ens_edge":  round(ens_edge,  1) if not np.isnan(ens_edge)  else None,
+            "nbm_edge":  round(nbm_edge,  1) if not np.isnan(nbm_edge)  else None,
+            "aifs_edge": round(aifs_edge, 1) if not np.isnan(aifs_edge) else None,
+        })
+
     if agreed:
-        print(f"\n  ★ Both sources agree (|edge| ≥ 5pp, same direction):")
-        for lbl, ens_e, nbm_e in agreed:
-            direction = "OVER" if ens_e > 0 else "UNDER"
-            print(f"    {lbl}: {direction}  ENS {ens_e:+.1f}pp  NBM {nbm_e:+.1f}pp")
+        lines.append(f"\n  ★ Consensus (≥2 sources agree, |edge| ≥ 5pp, same direction):")
+        for lbl, e_ens, e_nbm, e_aifs in agreed:
+            direction = "OVER" if e_ens > 0 else "UNDER"
+            parts = [f"ENS {e_ens:+.1f}pp"]
+            if e_nbm  is not None and not np.isnan(e_nbm):
+                parts.append(f"NBM {e_nbm:+.1f}pp")
+            if e_aifs is not None and not np.isnan(e_aifs):
+                parts.append(f"AIFS {e_aifs:+.1f}pp")
+            lines.append(f"    {lbl}: {direction}  " + "  ".join(parts))
+
+    return lines, edges
 
 
-# --- CLI ---
+# ─── AI-optimised summary block ───────────────────────────────────────────────
 
-def parse_location(arg):
+def _print_ai_summary(
+    label, station_id, target_date, now_utc, tz_name,
+    obs_r: dict, metar_r: dict,
+    nws_r: dict, hrrr_r: dict, nbm_r: dict, gfs_r: dict,
+    ifs_det_r: dict, aifs_det_r: dict,
+    nbm_qmd_r: dict | None,
+    ifs_ens_r: dict, aifs_ens_r: dict, ens_pp_r: dict,
+    poly_r: dict, edge_data: list[dict],
+    afd_r: dict,
+) -> None:
+    sep = "═" * 70
+    print(f"\n{sep}")
+    print(f"  [AI SUMMARY]  {label} — {target_date}")
+    print(sep)
+
+    # ── Observation floor ──
+    obs_high_f = obs_r.get("high_routine_f")
+    tz         = ZoneInfo(tz_name) if tz_name else timezone.utc
+    eod        = datetime(int(target_date[:4]), int(target_date[5:7]),
+                          int(target_date[8:10]), 23, 59, 59, tzinfo=tz)
+    hours_left = max(0.0, (eod.astimezone(timezone.utc) - now_utc).total_seconds() / 3600)
+
+    obs_floor_str = (f"{obs_high_f:.1f}°F  ({obs_r.get('high_routine_local')})"
+                     if obs_high_f else "n/a")
+    cur_temp_f = metar_r.get("temp_f")
+    cur_temp_str = (f"{cur_temp_f:.1f}°F  ({metar_r.get('time_str')})"
+                    if cur_temp_f else "n/a")
+    print(f"\nOBS FLOOR (routine METAR high so far):  {obs_floor_str}")
+    print(f"CURRENT TEMP:  {cur_temp_str}")
+    print(f"HOURS REMAINING IN DAY:  {hours_left:.1f}h")
+
+    # ── Deterministic model consensus ──
+    det_vals = {
+        "HRRR":  hrrr_r.get("temp_f"),
+        "NBM":   nbm_r.get("temp_f"),
+        "GFS":   gfs_r.get("temp_f"),
+        "IFS":   ifs_det_r.get("temp_f"),
+        "AIFS":  aifs_det_r.get("temp_f"),
+        "NWS":   nws_r.get("max_temp_f"),
+    }
+    live_vals = {k: v for k, v in det_vals.items() if v is not None}
+    print(f"\nDETERMINISTIC MODEL CONSENSUS")
+    vals_str = "  ".join(f"{k}={v:.1f}°F" for k, v in live_vals.items())
+    print(f"  Models:    {vals_str if vals_str else 'none available'}")
+    if live_vals:
+        arr        = np.array(list(live_vals.values()))
+        consensus  = float(np.mean(arr))
+        spread_std = float(np.std(arr))
+        agree_flag = "AGREE" if spread_std < 2.0 else "DISAGREE"
+        print(f"  Consensus: {consensus:.1f}°F  (σ={spread_std:.1f}°F across {len(arr)} models — models {agree_flag})")
+        if obs_high_f:
+            gap = consensus - obs_high_f
+            if gap > 0:
+                print(f"  Obs is {gap:.1f}°F below consensus — some heating still expected")
+            else:
+                print(f"  Obs has already met/exceeded consensus — daily high likely locked")
+    else:
+        consensus = None
+
+    # ── Probabilistic distributions ──
+    print(f"\nPROBABILISTIC DISTRIBUTIONS (remaining daily max)")
+    p_labels = [10, 25, 50, 75, 90]
+
+    if nbm_qmd_r and nbm_qmd_r.get("peak_hour"):
+        ph = nbm_qmd_r["peak_hour"]
+        ph_str = "  ".join(f"P{p}={ph[p]:.1f}" for p in p_labels if p in ph)
+        print(f"  NBM QMD peak-hour:  {ph_str}°F")
+    if nbm_qmd_r and nbm_qmd_r.get("daily_max"):
+        dm = nbm_qmd_r["daily_max"]
+        dm_str = "  ".join(f"P{p}={dm[p]:.1f}" for p in p_labels if p in dm)
+        print(f"  NBM QMD daily-max:  {dm_str}°F")
+
+    if ens_pp_r.get("member_highs"):
+        pp  = np.percentile(np.array(ens_pp_r["member_highs"]), p_labels)
+        pp_str = "  ".join(f"P{p}={v:.1f}" for p, v in zip(p_labels, pp))
+        print(f"  ENS PP (IFS-based): {pp_str}°F")
+    if aifs_ens_r.get("member_highs"):
+        ap  = np.percentile(np.array(aifs_ens_r["member_highs"]), p_labels)
+        ap_str = "  ".join(f"P{p}={v:.1f}" for p, v in zip(p_labels, ap))
+        print(f"  AIFS ENS (raw):     {ap_str}°F")
+
+    # Dew point context at peak hour
+    for tag, r in [("HRRR", hrrr_r), ("NBM", nbm_r), ("GFS", gfs_r)]:
+        if r.get("dewp_f") is not None:
+            print(f"  Dew point at {tag} peak: {r['dewp_f']:.1f}°F  "
+                  f"(spread {r['temp_f']:.1f}–{r['dewp_f']:.1f} = "
+                  f"{r['temp_f'] - r['dewp_f']:.0f}°F dep)")
+            break  # show only one
+
+    # ── Market odds + edge table ──
+    if poly_r.get("rows"):
+        print(f"\nMARKET ODDS + EDGE TABLE  (slug: {poly_r.get('slug', 'n/a')})")
+        if edge_data:
+            has_nbm  = any(e.get("nbm_edge")  is not None for e in edge_data)
+            has_aifs = any(e.get("aifs_edge") is not None for e in edge_data)
+            header = f"  {'Bucket':<22}  {'Market':>7}  {'ENS PP':>7}"
+            if has_nbm:
+                header += f"  {'NBM':>7}"
+            if has_aifs:
+                header += f"  {'AIFS':>7}"
+            header += f"  {'ENS edge':>9}"
+            if has_nbm:
+                header += f"  {'NBM edge':>9}"
+            if has_aifs:
+                header += f"  {'AIFSedge':>9}"
+            print(header)
+            for e in edge_data:
+                ep = e.get('ens_prob')
+                row = (f"  {e['bucket']:<22}  {e['market_prob']:>6.1f}%"
+                       f"  {ep:>6.1f}%" if ep is not None else
+                       f"  {e['bucket']:<22}  {e['market_prob']:>6.1f}%  {'n/a':>7}")
+                if has_nbm:
+                    np_ = e.get('nbm_prob')
+                    row += f"  {np_:>6.1f}%" if np_ is not None else f"  {'n/a':>7}"
+                if has_aifs:
+                    ap = e.get('aifs_prob')
+                    row += f"  {ap:>6.1f}%" if ap is not None else f"  {'n/a':>7}"
+                ens_e = e.get('ens_edge')
+                row += f"  {ens_e:>+8.1f}pp" if ens_e is not None else f"  {'n/a':>9}"
+                if has_nbm:
+                    ne = e.get('nbm_edge')
+                    row += f"  {ne:>+8.1f}pp" if ne is not None else f"  {'n/a':>9}"
+                if has_aifs:
+                    ae = e.get('aifs_edge')
+                    row += f"  {ae:>+8.1f}pp" if ae is not None else f"  {'n/a':>9}"
+                # Consensus flag
+                cons_edges = [x for x in [ens_e, e.get('nbm_edge'), e.get('aifs_edge')]
+                              if x is not None and abs(x) >= 5]
+                if len(cons_edges) >= 2 and len(set(int(x > 0) for x in cons_edges)) == 1:
+                    row += "  ★"
+                print(row)
+
+    # ── Consensus edge flags ──
+    consensus_buckets = [
+        e for e in edge_data
+        if sum(1 for x in [e.get('ens_edge'), e.get('nbm_edge'), e.get('aifs_edge')]
+               if x is not None and abs(x) >= 5) >= 2
+        and len(set(int(x > 0) for x in [e.get('ens_edge'), e.get('nbm_edge'), e.get('aifs_edge')]
+                    if x is not None and abs(x) >= 5)) == 1
+    ]
+    if consensus_buckets:
+        print(f"\nCONSENSUS EDGE FLAGS (≥2 of 3 model sources agree, |edge| ≥ 5pp):")
+        for e in consensus_buckets:
+            direction = "OVER" if (e.get('ens_edge') or 0) > 0 else "UNDER"
+            parts = []
+            for src, k in [("ENS", "ens_edge"), ("NBM", "nbm_edge"), ("AIFS", "aifs_edge")]:
+                v = e.get(k)
+                if v is not None:
+                    parts.append(f"{src} {v:+.1f}pp")
+            print(f"  ★ {e['bucket']}: {direction}  " + "  ".join(parts))
+    else:
+        print(f"\nCONSENSUS EDGE FLAGS: none flagged (no bucket with ≥2 sources at ≥5pp)")
+
+    # ── Qualitative risk flags ──
+    print(f"\nQUALITATIVE RISK FLAGS:")
+    flags_printed = 0
+
+    if live_vals:
+        if spread_std > 3.0:
+            print(f"  ⚠ High inter-model spread (σ={spread_std:.1f}°F) — significant model uncertainty")
+            flags_printed += 1
+        elif spread_std < 1.0:
+            print(f"  ✓ Models in tight agreement (σ={spread_std:.1f}°F)")
+            flags_printed += 1
+
+    # AIFS vs IFS disagreement
+    if ifs_det_r.get("temp_f") and aifs_det_r.get("temp_f"):
+        diff = abs(ifs_det_r["temp_f"] - aifs_det_r["temp_f"])
+        if diff > 3.0:
+            print(f"  ⚠ AIFS ({aifs_det_r['temp_f']:.1f}°F) vs IFS ({ifs_det_r['temp_f']:.1f}°F) "
+                  f"disagree by {diff:.1f}°F — high model uncertainty")
+            flags_printed += 1
+
+    # Obs floor proximity
+    if obs_high_f and consensus:
+        gap = consensus - obs_high_f
+        if gap < 2.0:
+            print(f"  ⚠ Obs floor ({obs_high_f:.1f}°F) within 2°F of consensus — daily high nearly locked")
+            flags_printed += 1
+        elif gap > 8.0:
+            print(f"  ⚠ Large gap between obs ({obs_high_f:.1f}°F) and consensus ({consensus:.1f}°F) — "
+                  f"forecast highly dependent on remaining heating")
+            flags_printed += 1
+
+    # Hours remaining
+    if hours_left < 3:
+        print(f"  ⚠ Only {hours_left:.1f}h remaining in day — limited time for surprises")
+        flags_printed += 1
+
+    # Dew point flag
+    for tag, r in [("HRRR", hrrr_r), ("NBM", nbm_r), ("GFS", gfs_r)]:
+        if r.get("temp_f") and r.get("dewp_f"):
+            dep = r["temp_f"] - r["dewp_f"]
+            if dep < 10:
+                print(f"  ⚠ Low dew point depression at {tag} peak ({dep:.0f}°F) — "
+                      f"high moisture may suppress max temp")
+                flags_printed += 1
+            break
+
+    if flags_printed == 0:
+        print(f"  ✓ No significant risk flags identified")
+
+    # ── NWS AFD excerpt ──
+    if afd_r.get("short_term"):
+        print(f"\nNWS AFD SHORT TERM (WFO {afd_r.get('wfo', '?')}):")
+        for ln in afd_r["short_term"][:800].splitlines():
+            print(f"  {ln}")
+
+    print(f"\n{sep}\n")
+
+
+# ─── JSON output ──────────────────────────────────────────────────────────────
+
+def _build_json_payload(
+    label, station_id, lat, lon, target_date, now_utc, tz_name,
+    obs_r, metar_r, nws_r, hrrr_r, nbm_r, gfs_r,
+    ifs_det_r, aifs_det_r, nbm_qmd_r,
+    ifs_ens_r, aifs_ens_r, ens_pp_r,
+    poly_r, edge_data, afd_r,
+) -> dict:
+    def _pctls(members):
+        if not members:
+            return None
+        arr = np.array(members)
+        return {str(p): round(float(np.percentile(arr, p)), 2)
+                for p in [5, 10, 25, 50, 75, 90, 95]}
+
+    return {
+        "run_utc":     now_utc.isoformat(),
+        "target_date": target_date,
+        "station": {"id": station_id, "label": label,
+                    "lat": lat, "lon": lon, "timezone": tz_name},
+        "observations": {
+            "current_temp_f":     metar_r.get("temp_f"),
+            "current_temp_time":  metar_r.get("time_str"),
+            "daily_high_all_f":   obs_r.get("high_all_f"),
+            "daily_high_routine_f": obs_r.get("high_routine_f"),
+            "history":            obs_r.get("history", []),
+        },
+        "models": {
+            "nws":      {"max_temp_f": nws_r.get("max_temp_f")},
+            "hrrr":     {k: hrrr_r.get(k) for k in ("temp_f", "dewp_f", "wind_mph", "peak_time")},
+            "nbm":      {k: nbm_r.get(k)  for k in ("temp_f", "dewp_f", "wind_mph", "peak_time")},
+            "gfs":      {k: gfs_r.get(k)  for k in ("temp_f", "dewp_f", "wind_mph", "peak_time")},
+            "ifs_det":  {"max_temp_f": ifs_det_r.get("temp_f")},
+            "aifs_det": {"max_temp_f": aifs_det_r.get("temp_f")},
+            "nbm_qmd":  {
+                "peak_hour":  nbm_qmd_r.get("peak_hour") if nbm_qmd_r else None,
+                "daily_max":  nbm_qmd_r.get("daily_max") if nbm_qmd_r else None,
+                "run_str":    nbm_qmd_r.get("run_str")   if nbm_qmd_r else None,
+            },
+            "ifs_ens":     {"member_highs": ifs_ens_r.get("member_highs"),
+                            "percentiles": _pctls(ifs_ens_r.get("member_highs"))},
+            "ifs_ens_pp":  {"member_highs": ens_pp_r.get("member_highs"),
+                            "anchor": ens_pp_r.get("anchor"),
+                            "percentiles": _pctls(ens_pp_r.get("member_highs"))},
+            "aifs_ens":    {"member_highs": aifs_ens_r.get("member_highs"),
+                            "percentiles": _pctls(aifs_ens_r.get("member_highs"))},
+        },
+        "market": {
+            "slug":    poly_r.get("slug"),
+            "buckets": [{"label": lbl, "market_prob_pct": prob}
+                        for lbl, prob in (poly_r.get("rows") or [])],
+        },
+        "edges":            edge_data,
+        "nws_afd_short_term": afd_r.get("short_term"),
+    }
+
+
+# ─── Main orchestrator ────────────────────────────────────────────────────────
+
+_PRINT_LOCK = __import__("threading").Lock()
+
+def run_location(lat, lon, label, station_id, target_date: str,
+                 write_json: bool = False, json_dir: str = ".") -> None:
+    tz_name   = TIMEZONES.get(station_id)
+    now_utc   = datetime.now(timezone.utc)
+    tz        = ZoneInfo(tz_name) if tz_name else timezone.utc
+    local_str = now_utc.astimezone(tz).strftime("%H:%M %Z") if tz_name else ""
+    utc_str   = now_utc.strftime("%H:%Mz")
+
+    poly_slug = _polymarket_slug(station_id, target_date)
+
+    print(f"\n{label} — {target_date}  local {local_str} {utc_str}")
+
+    # ── Phase 7: concurrent independent fetches ───────────────────────────────
+    with ThreadPoolExecutor(max_workers=14) as ex:
+        fut_metar    = ex.submit(_fetch_current_metar,  station_id)
+        fut_obs      = ex.submit(_fetch_obs_history,    station_id, target_date, tz_name)
+        fut_nws      = ex.submit(_fetch_nws,            lat, lon, target_date, now_utc)
+        fut_hrrr     = ex.submit(_fetch_hrrr,           lat, lon, target_date, now_utc, tz_name)
+        fut_nbm      = ex.submit(_fetch_nbm,            lat, lon, target_date, now_utc, tz_name)
+        fut_gfs      = ex.submit(_fetch_gfs,            lat, lon, target_date, now_utc, tz_name)
+        fut_ifs_det  = ex.submit(_fetch_ifs_det,        lat, lon, target_date, now_utc, tz_name)
+        fut_aifs_det = ex.submit(_fetch_aifs_det,       lat, lon, target_date, now_utc, tz_name)
+        fut_ifs_ens  = ex.submit(_fetch_ifs_ens,        lat, lon, target_date, now_utc, tz_name)
+        fut_aifs_ens = ex.submit(_fetch_aifs_ens,       lat, lon, target_date, now_utc, tz_name)
+        fut_nbm_qmd  = ex.submit(nbm_qmd_high_percentiles,
+                                  lat, lon, now_utc, tz_name, target_date)
+        fut_poly     = ex.submit(_fetch_polymarket,     poly_slug, label)
+        fut_afd      = ex.submit(_fetch_nws_afd,        station_id)
+
+    # Collect results
+    metar_r    = fut_metar.result()
+    obs_r      = fut_obs.result()
+    nws_r      = fut_nws.result()
+    hrrr_r     = fut_hrrr.result()
+    nbm_r      = fut_nbm.result()
+    gfs_r      = fut_gfs.result()
+    ifs_det_r  = fut_ifs_det.result()
+    aifs_det_r = fut_aifs_det.result()
+    ifs_ens_r  = fut_ifs_ens.result()
+    aifs_ens_r = fut_aifs_ens.result()
+    nbm_qmd_r  = fut_nbm_qmd.result()
+    poly_r     = fut_poly.result()
+    afd_r      = fut_afd.result()
+
+    # obs_high floor for ensemble (routine METAR only)
+    obs_high = obs_r.get("high_routine_f")
+
+    # Print results in defined order
+    for line in metar_r["output"]:
+        print(line)
+    for line in obs_r["output"]:
+        print(line)
+
+    print("\n--- Highest temperature predictions for the remainder of the day ---")
+    for line in nws_r["output"]:
+        print(line)
+    for line in hrrr_r["output"]:
+        print(line)
+    for line in nbm_r["output"]:
+        print(line)
+    for line in gfs_r["output"]:
+        print(line)
+    for line in ifs_det_r["output"]:
+        print(line)
+    for line in aifs_det_r["output"]:
+        print(line)
+
+    if nbm_qmd_r:
+        for line in nbm_qmd_r["output"]:
+            print(line)
+
+    for line in ifs_ens_r["output"]:
+        print(line)
+    for line in aifs_ens_r["output"]:
+        print(line)
+
+    # Post-processed ensemble (sequential; depends on deterministic model vals)
+    ens_pp_r = _fetch_ens_pp(
+        lat, lon, label, target_date,
+        hrrr_r.get("temp_f"), nbm_r.get("temp_f"), gfs_r.get("temp_f"),
+        ifs_det_r.get("temp_f"), aifs_det_r.get("temp_f"),
+        now_utc, obs_high, tz_name,
+    )
+    for line in ens_pp_r["output"]:
+        print(line)
+
+    # Percentile compare
+    nbm_qmd_dm = nbm_qmd_r.get("daily_max") if nbm_qmd_r else None
+    _print_pctl_compare(ens_pp_r.get("member_highs"), nbm_qmd_dm,
+                        aifs_ens_r.get("member_highs"))
+
+    # Polymarket
+    for line in poly_r["output"]:
+        print(line)
+
+    # Bucket probabilities
+    nbm_bkts  = _nbm_bucket_probs(nbm_qmd_dm, poly_r.get("rows"), obs_high=obs_high)
+    aifs_bkts = _ens_bucket_probs(aifs_ens_r.get("member_highs"),
+                                   poly_r.get("rows"), obs_high=obs_high)
+
+    edge_lines, edge_data = compare_ensemble_to_market(
+        ens_pp_r.get("member_highs"), poly_r.get("rows"),
+        nbm_probs=nbm_bkts, aifs_probs=aifs_bkts,
+    )
+    for line in edge_lines:
+        print(line)
+
+    # NWS AFD
+    for line in afd_r["output"]:
+        print(line)
+
+    # AI summary block
+    _print_ai_summary(
+        label, station_id, target_date, now_utc, tz_name,
+        obs_r, metar_r,
+        nws_r, hrrr_r, nbm_r, gfs_r,
+        ifs_det_r, aifs_det_r,
+        nbm_qmd_r,
+        ifs_ens_r, aifs_ens_r, ens_pp_r,
+        poly_r, edge_data,
+        afd_r,
+    )
+
+    # JSON output
+    if write_json:
+        payload  = _build_json_payload(
+            label, station_id, lat, lon, target_date, now_utc, tz_name,
+            obs_r, metar_r, nws_r, hrrr_r, nbm_r, gfs_r,
+            ifs_det_r, aifs_det_r, nbm_qmd_r,
+            ifs_ens_r, aifs_ens_r, ens_pp_r,
+            poly_r, edge_data, afd_r,
+        )
+        fname = (f"{json_dir}/{station_id}_{target_date}_"
+                 f"{now_utc.strftime('%H%M')}z.json")
+        with open(fname, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"[JSON]        written → {fname}")
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def parse_location(arg: str) -> tuple:
     key = arg.lower()
     if key in PRESETS:
         return PRESETS[key]
@@ -958,64 +1769,41 @@ def parse_location(arg):
     print(f"Presets: {', '.join(PRESETS.keys())}")
     sys.exit(1)
 
-def run_location(lat, lon, label, station_id, poly_slug=None):
-    tz_name   = TIMEZONES.get(station_id)
-    now_utc   = datetime.now(timezone.utc)
-    local_str = now_utc.astimezone(ZoneInfo(tz_name)).strftime("%H:%M %Z") if tz_name else ""
-    utc_str   = now_utc.strftime("%H:%Mz")
-    print(f"\n{label} — {TARGET_DATE}  local {local_str} {utc_str}")
-    temp_f, ts = fetch_current_metar(station_id)
-    if temp_f is not None:
-        print(f"[OBS CURRENT]{temp_f:.1f}°F  current temperature  (updated {ts})")
-    else:
-        print(f"[OBS CURRENT]no data")
-    obs_high_true, obs_local_true, obs_utc_true = fetch_observed_high_today(station_id, TARGET_DATE, tz_name, routine_only=False)
-    obs_high,      obs_local_time, obs_utc_time = fetch_observed_high_today(station_id, TARGET_DATE, tz_name, routine_only=True)
-    if obs_high_true is not None:
-        print(f"[OBS HIGH]   {obs_high_true:.1f}°F  observed high today (all obs)  ({obs_local_true} / {obs_utc_true})")
-    else:
-        print(f"[OBS HIGH]   no data")
-    if obs_high is not None:
-        suffix = f"  ← ENS floor" if obs_high != obs_high_true else ""
-        print(f"[OBS ROUTINE]{obs_high:.1f}°F  routine METARs only  ({obs_local_time} / {obs_utc_time}){suffix}")
-    else:
-        print(f"[OBS ROUTINE] no data")
-    print()
-    print("--- Highest temperature predictions for the remainder of the day ---")
-    nws_high(lat, lon, TARGET_DATE, now_utc)
-    hrrr_val    = hrrr_high(lat, lon, TARGET_DATE, now_utc, obs_high=obs_high, tz_name=tz_name)
-    nbm_val     = nbm_high(lat, lon, TARGET_DATE, now_utc, obs_high=obs_high, tz_name=tz_name)
-    nbm_pctls   = nbm_qmd_high_percentiles(lat, lon, now_utc, tz_name, TARGET_DATE, obs_high=obs_high)
-    ifs_val     = ecmwf_deterministic_high(lat, lon, TARGET_DATE, now_utc, obs_high=obs_high, tz_name=tz_name)
-    inflated_members = ecmwf_ensemble_postprocessed(
-        lat, lon, label, TARGET_DATE, hrrr_val, nbm_val, ifs_val, now_utc, obs_high=obs_high, tz_name=tz_name)
-    _print_pctl_compare(inflated_members, nbm_pctls)
-    market_rows = None
-    if poly_slug:
-        market_rows = polymarket_odds(poly_slug, label)
-    nbm_bkts = _nbm_bucket_probs(nbm_pctls, market_rows, obs_high=obs_high)
-    compare_ensemble_to_market(inflated_members, market_rows, nbm_probs=nbm_bkts)
-
 
 LOG_PATH = "weathernew.log"
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python weathernew.py <location> [location ...]")
-        print(f"Presets: {', '.join(PRESETS.keys())}, all")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="US weather data collector for Polymarket temperature edge analysis")
+    parser.add_argument("locations", nargs="+",
+                        help="Station key(s) from presets, or 'all'")
+    parser.add_argument("--date", default=None,
+                        help="Target date YYYY-MM-DD (default: today in station local time)")
+    parser.add_argument("--json", action="store_true",
+                        help="Write per-location JSON output files")
+    parser.add_argument("--json-dir", default=".", metavar="DIR",
+                        help="Directory for JSON files (default: current dir)")
+    args = parser.parse_args()
 
-    args = sys.argv[1:]
-    if len(args) == 1 and args[0].lower() == "all":
+    if len(args.locations) == 1 and args.locations[0].lower() == "all":
         locations = [(*v,) for v in PRESETS.values()]
     else:
-        locations = [parse_location(a) for a in args]
+        locations = [parse_location(a) for a in args.locations]
 
     tee = _Tee(LOG_PATH)
     sys.stdout = tee
     try:
-        for lat, lon, label, station_id, poly_slug in locations:
-            run_location(lat, lon, label, station_id, poly_slug)
+        for lat, lon, label, station_id in locations:
+            # Determine target date in station's local timezone
+            if args.date:
+                target_date = args.date
+            else:
+                tz_name     = TIMEZONES.get(station_id)
+                local_tz    = ZoneInfo(tz_name) if tz_name else timezone.utc
+                target_date = datetime.now(local_tz).strftime("%Y-%m-%d")
+
+            run_location(lat, lon, label, station_id, target_date,
+                         write_json=args.json, json_dir=args.json_dir)
             print()
     finally:
         tee.close()
